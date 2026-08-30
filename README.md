@@ -2,7 +2,33 @@
 
 17-topic interview prep for Agentic AI, researched across 5 independent model passes. Each version brings a different strength — this guide tells you which to read first per topic.
 
-## Versions Available
+## Consolidated Study Guide (Start Here)
+
+**[`consolidated_study_guide.md`](consolidated_study_guide.md)** — A single 8,300-line document covering all 17 topics, synthesized from the best sources (winner + runner-up) for each topic.
+
+Every module follows a consistent structure:
+
+| Section | Purpose |
+|---------|---------|
+| **What Is This?** | Plain-language explanation with analogies and examples — no jargon assumed |
+| **Why It Matters** | Practical importance in 2-3 sentences |
+| **Core Content** | Architecture patterns, trade-offs, production details, ASCII diagrams |
+| **Common Failure Modes** | Structured table: cause, detection, mitigation |
+| **Key Takeaways** | 5-8 bullet-point summary |
+| **Interview Q&A** | 10-12 first-person Q&A pairs you can practice out loud |
+| **Key Numbers to Memorize** | Categorized statistics and benchmarks |
+| **Quick Reference** | Decision trees, checklists, cheat sheets |
+
+**How to use it:**
+- **Learning from scratch?** Read the "What Is This?" sections first for all 17 topics to build the mental map, then go deep per module.
+- **Interview prep?** Focus on the Interview Q&A and Key Numbers sections — cover the answer, try to answer from memory.
+- **Night-before revision?** Skim the Quick Reference and Key Takeaways across all modules.
+
+### Also available: `final/` (deep-dive per-topic files)
+
+The `final/` directory contains 16 individual module files (missing Module 15) with even more depth — more code examples, larger failure mode tables, and exhaustive reference material. Use these when the consolidated guide's coverage of a specific topic isn't enough.
+
+## Raw Research Versions
 
 | Folder | Model | Total Lines | Key Strength |
 |--------|-------|-------------|--------------|
@@ -38,31 +64,37 @@ For each topic: **Winner** = read this first for deepest understanding. **Runner
 
 ## Study Strategy
 
-### Primary Reading Plan
+### Recommended Flow
 
-**Modules 01–05 (Foundations):** Read `research_opus_4.6` first — it's 2–3x deeper than everything else on these foundational topics. Then read the corresponding `research_cursor_grok` module for interview-specific framing and enterprise production context.
-
-**Modules 06–17 (Applied & Production):** Read `research_cursor_grok` as your primary source — it's consistently the deepest and most interview-grounded across all these topics. Then skim `research_gpt_sol` for its concise "Interview Review" Q&A bullets at the end of each module — perfect for last-minute recall.
-
-### Quick Revision (Night Before)
-
-The `research_gpt_sol` "Interview Review" sections distill each topic into 5–6 sharp one-liner answers. Skim all 17 of those sections in sequence for a rapid refresher.
+1. **First pass** — Read `consolidated_study_guide.md` end to end. The "What Is This?" intros build foundational understanding; the core content covers architecture and production patterns.
+2. **Active recall** — Go back through the Interview Q&A sections. Cover the answer, attempt the question, check yourself.
+3. **Memorization** — Drill the Key Numbers tables. These are the statistics interviewers expect you to know.
+4. **Deep dives** — For topics where you want more depth, read the `final/` file or the raw research versions below.
+5. **Night before** — Skim Quick Reference sections and Key Takeaways across all 17 modules.
 
 ### If You Only Have 3 Days
 
-| Day | Topics | Primary Source |
-|-----|--------|----------------|
-| 1 | 01 LLM Foundations, 02 Context Engineering, 03 Tool Use | `research_opus_4.6` |
-| 2 | 04 Agent Architecture, 06 RAG, 07 Memory, 09 Multi-Agent | `research_cursor_grok` |
-| 3 | 12 Evaluation, 13 Security, 15 Inference Optimization, 16 Production | `research_cursor_grok` + `research_gpt_sol` interview review sections |
+| Day | Topics | What to Read |
+|-----|--------|--------------|
+| 1 | 01 LLM Foundations, 02 Context Engineering, 03 Tool Use, 04 Agent Architecture | Consolidated guide modules 01-04 (basics + core + Q&A) |
+| 2 | 06 RAG, 07 Memory, 09 Multi-Agent, 10 MCP, 12 Evaluation | Consolidated guide modules 06-12 |
+| 3 | 13 Security, 15 Inference Optimization, 16 Production, 17 Autonomous Agents | Consolidated guide modules 13-17 + all Key Numbers tables |
 
 ### Interview Prep Tips
 
 - For each module, extract: 3 architecture patterns, 3 failure modes, 2 security risks, 1 trade-off you can defend out loud.
+- Practice the Interview Q&A sections out loud — the answers are written in first person, ready to speak verbatim.
 - Practice whiteboarding the ASCII topology diagrams from memory (control plane / data plane / tool proxies / persistence / telemetry).
 - Be ready to talk in layers: model → context → tools → orchestration → memory → evaluation → security → production.
 - Anchor answers on trade-offs, not tool names. "I'd choose X because of Y constraint" beats "I'd use LangGraph."
-- The `research_cursor_grok` modules explicitly frame content around "interview answers that fail when the follow-up is..." — use those as self-test prompts.
+
+### Going Deeper (Raw Research)
+
+For any topic where the consolidated guide isn't enough, read the raw research versions:
+
+**Modules 01–05 (Foundations):** Read `research_opus_4.6` — it's 2–3x deeper than everything else on foundational topics.
+
+**Modules 06–17 (Applied & Production):** Read `research_cursor_grok` — consistently the deepest and most interview-grounded. Supplement with `research_gpt_sol` for its concise "Interview Review" Q&A bullets.
 
 ## Module Index (All Topics)
 
