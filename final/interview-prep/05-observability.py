@@ -1,572 +1,670 @@
 """
-LLM/Agent Observability - Code Examples
+LLM & Agent Observability -- Interview Prep Code Snippets
 
-Extracted from 05-observability.md. Covers:
-- Checkpoint design for durable execution of long-running agents
-- Production-grade LLM observability runtime including:
-  - PII redaction (3-layer: detection, redaction, verification)
-  - Circuit breaker (fail fast on repeated failures)
-  - Retry with exponential backoff + jitter
-  - Audit sink (immutable log for consequential actions)
-  - Telemetry runtime (OTel spans, metrics, tail sampling)
-  - Cost tracking and circuit breaker
-  - Drift detection
+Covers the three observability layers (metrics, traces, audit), OpenTelemetry
+instrumentation for LLM calls, tail-sampling decision logic, cost tracking,
+PII-safe export pipelines, and burn-rate SLO alerting. All examples use stdlib
+or lightweight stubs so the file is self-contained and runnable.
 """
+from __future__ import annotations
 
-
-# --- Section: Durable Execution for Long-Running Agents ---
-
-checkpoint = {
-    "thread_id": "thread_abc123",
-    "checkpoint_id": "ckpt_5",
-    "timestamp": "2026-09-02T10:15:30Z",
-    "state": {
-        "variables": {"user_query": "...", "retrieved_docs": [...]},
-        "history": [{"role": "user", "content": "..."}, ...]
-    },
-    "next_step": "tool_call_weather_api",
-    "trace_id": "trace_def456"  # link back to observability
-}
-
-
-# --- Section: Production Code: PII Pipeline, Circuit Breaker, Retry, Audit, Telemetry Runtime ---
-
-"""
-Production-grade LLM observability runtime.
-
-Includes:
-- PII redaction (3-layer: detection, redaction, verification)
-- Circuit breaker (fail fast on repeated failures)
-- Retry with exponential backoff + jitter
-- Audit sink (immutable log for consequential actions)
-- Telemetry runtime (OTel spans, metrics, tail sampling)
-- Cost tracking and circuit breaker
-- Drift detection
-
-~800 lines total (complete, no placeholders).
-"""
-
+import functools
 import hashlib
-import logging
-import re
-import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
-import random
+import hmac
 import json
+import logging
+import random
+import re
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Callable, Optional
 
-# Third-party imports (assume installed)
-from opentelemetry import trace, metrics
-from opentelemetry.trace import Status, StatusCode
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
-from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
-logger = logging.getLogger(__name__)
-
-# ============================================================================
-# PII Redaction (3-layer pipeline)
-# ============================================================================
-
-class PIIType(Enum):
-    SSN = "SSN"
-    CREDIT_CARD = "CREDIT_CARD"
-    EMAIL = "EMAIL"
-    PHONE = "PHONE"
-    PERSON = "PERSON"
-    ADDRESS = "ADDRESS"
-    ACCOUNT_ID = "ACCOUNT_ID"
-    SESSION_TOKEN = "SESSION_TOKEN"
+# =============================================================================
+# --- Section 1: OpenTelemetry Trace Setup for LLM Calls ---------------------
+# =============================================================================
+# In production you'd use the real opentelemetry-api / opentelemetry-sdk.
+# These stubs mirror the real API surface so the patterns are portable.
 
 @dataclass
-class PIIMatch:
-    type: PIIType
-    start: int
-    end: int
-    text: str
-    confidence: float
+class Span:
+    """Minimal OTel span stub.  Real spans live in opentelemetry.trace."""
+    name: str
+    trace_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    span_id: str = field(default_factory=lambda: uuid.uuid4().hex[:16])
+    parent_id: Optional[str] = None
+    attributes: dict = field(default_factory=dict)
+    status: str = "UNSET"       # UNSET | OK | ERROR
+    start_ns: int = field(default_factory=time.monotonic_ns)
+    end_ns: Optional[int] = None
+    events: list = field(default_factory=list)
 
-class PIIDetector:
-    """Layer 1: Detection using regex + NER patterns."""
+    def set_attribute(self, key: str, value: Any) -> None:
+        self.attributes[key] = value
 
-    PATTERNS = {
-        PIIType.SSN: re.compile(r'\b\d{3}-\d{2}-\d{4}\b'),
-        PIIType.CREDIT_CARD: re.compile(r'\b(?:\d{4}[-\s]?){3}\d{4}\b'),
-        PIIType.EMAIL: re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'),
-        PIIType.PHONE: re.compile(r'\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b'),
-        PIIType.ACCOUNT_ID: re.compile(r'\b(?:user|account|customer)_[a-z0-9]{8,}\b', re.IGNORECASE),
-        PIIType.SESSION_TOKEN: re.compile(r'\b[a-f0-9]{32,}\b'),  # hex strings likely tokens
-    }
+    def set_status(self, status: str) -> None:
+        self.status = status
 
-    def detect(self, text: str) -> List[PIIMatch]:
-        matches = []
-        for pii_type, pattern in self.PATTERNS.items():
-            for match in pattern.finditer(text):
-                matches.append(PIIMatch(
-                    type=pii_type,
-                    start=match.start(),
-                    end=match.end(),
-                    text=match.group(),
-                    confidence=1.0  # regex is deterministic
-                ))
+    def add_event(self, name: str, attributes: dict | None = None) -> None:
+        self.events.append({"name": name, "attributes": attributes or {}})
 
-        # Entropy check for high-entropy strings (likely secrets)
-        for match in re.finditer(r'\b[A-Za-z0-9+/=]{24,}\b', text):
-            entropy = self._calculate_entropy(match.group())
-            if entropy > 4.0:  # high entropy threshold
-                matches.append(PIIMatch(
-                    type=PIIType.SESSION_TOKEN,
-                    start=match.start(),
-                    end=match.end(),
-                    text=match.group(),
-                    confidence=entropy / 5.0  # normalize to 0-1
-                ))
+    def end(self) -> None:
+        self.end_ns = time.monotonic_ns()
 
-        return sorted(matches, key=lambda m: m.start)
-
-    @staticmethod
-    def _calculate_entropy(s: str) -> float:
-        """Shannon entropy calculation."""
-        if not s:
+    @property
+    def duration_ms(self) -> float:
+        if self.end_ns is None:
             return 0.0
-        freq = {}
-        for c in s:
-            freq[c] = freq.get(c, 0) + 1
-        entropy = 0.0
-        for count in freq.values():
-            p = count / len(s)
-            entropy -= p * (p and (p * (2 ** -1)).bit_length() or 0)
-        return entropy
+        return (self.end_ns - self.start_ns) / 1_000_000
 
-class PIIRedactor:
-    """Layer 2: Redaction strategies."""
 
-    def __init__(self, mode: str = "replace"):
-        self.mode = mode  # "replace", "hash", "truncate"
-        self.detector = PIIDetector()
+class Tracer:
+    """Stub tracer that collects spans in memory."""
 
-    def redact(self, text: str) -> tuple[str, List[PIIMatch]]:
-        matches = self.detector.detect(text)
-        if not matches:
-            return text, []
+    def __init__(self, name: str = "llm-service"):
+        self.name = name
+        self.spans: list[Span] = []
 
-        # Redact from end to start (preserves indices)
-        result = text
-        for match in reversed(matches):
-            if self.mode == "replace":
-                replacement = f"<{match.type.value}>"
-            elif self.mode == "hash":
-                hash_val = hashlib.sha256(match.text.encode()).hexdigest()[:8]
-                replacement = f"<{match.type.value}_{hash_val}>"
-            elif self.mode == "truncate":
-                replacement = f"<{match.type.value}>"
-            else:
-                replacement = f"<{match.type.value}>"
-
-            result = result[:match.start] + replacement + result[match.end:]
-
-        return result, matches
-
-class PIIVerifier:
-    """Layer 3: Verification (check for missed PII)."""
-
-    def __init__(self, sample_rate: float = 0.01):
-        self.sample_rate = sample_rate
-        self.detector = PIIDetector()
-
-    def verify(self, redacted_text: str) -> bool:
-        """Returns True if verification passes (no PII found)."""
-        if random.random() > self.sample_rate:
-            return True  # skip verification (sampling)
-
-        matches = self.detector.detect(redacted_text)
-        if matches:
-            logger.warning(f"PII verification failed: found {len(matches)} potential PII in redacted text")
-            return False
-        return True
-
-# ============================================================================
-# Circuit Breaker
-# ============================================================================
-
-class CircuitState(Enum):
-    CLOSED = "CLOSED"
-    OPEN = "OPEN"
-    HALF_OPEN = "HALF_OPEN"
-
-@dataclass
-class CircuitBreakerConfig:
-    failure_threshold: int = 5
-    timeout_seconds: float = 30.0
-    success_threshold: int = 2  # successes needed in HALF_OPEN to close
-
-class CircuitBreaker:
-    def __init__(self, config: CircuitBreakerConfig):
-        self.config = config
-        self.state = CircuitState.CLOSED
-        self.failure_count = 0
-        self.success_count = 0
-        self.last_failure_time: Optional[float] = None
-
-    def call(self, func: Callable, *args, **kwargs) -> Any:
-        if self.state == CircuitState.OPEN:
-            if time.time() - self.last_failure_time > self.config.timeout_seconds:
-                logger.info("Circuit breaker: OPEN -> HALF_OPEN")
-                self.state = CircuitState.HALF_OPEN
-                self.success_count = 0
-            else:
-                raise RuntimeError(f"Circuit breaker OPEN (fails: {self.failure_count})")
-
-        try:
-            result = func(*args, **kwargs)
-            self._on_success()
-            return result
-        except Exception as e:
-            self._on_failure()
-            raise e
-
-    def _on_success(self):
-        if self.state == CircuitState.HALF_OPEN:
-            self.success_count += 1
-            if self.success_count >= self.config.success_threshold:
-                logger.info("Circuit breaker: HALF_OPEN -> CLOSED")
-                self.state = CircuitState.CLOSED
-                self.failure_count = 0
-        elif self.state == CircuitState.CLOSED:
-            self.failure_count = 0  # reset on success
-
-    def _on_failure(self):
-        self.failure_count += 1
-        self.last_failure_time = time.time()
-
-        if self.state == CircuitState.HALF_OPEN:
-            logger.info("Circuit breaker: HALF_OPEN -> OPEN (probe failed)")
-            self.state = CircuitState.OPEN
-        elif self.state == CircuitState.CLOSED:
-            if self.failure_count >= self.config.failure_threshold:
-                logger.warning(f"Circuit breaker: CLOSED -> OPEN (failures: {self.failure_count})")
-                self.state = CircuitState.OPEN
-
-# ============================================================================
-# Retry with Exponential Backoff + Jitter
-# ============================================================================
-
-@dataclass
-class RetryConfig:
-    max_retries: int = 3
-    base_delay: float = 1.0
-    max_delay: float = 60.0
-    jitter: bool = True
-
-class RetryPolicy:
-    def __init__(self, config: RetryConfig):
-        self.config = config
-
-    def call(self, func: Callable, *args, **kwargs) -> Any:
-        last_exception = None
-        for attempt in range(self.config.max_retries + 1):
-            try:
-                return func(*args, **kwargs)
-            except Exception as e:
-                last_exception = e
-                if attempt < self.config.max_retries:
-                    delay = self._calculate_delay(attempt)
-                    logger.warning(f"Retry {attempt + 1}/{self.config.max_retries} after {delay:.2f}s: {e}")
-                    time.sleep(delay)
-
-        raise last_exception
-
-    def _calculate_delay(self, attempt: int) -> float:
-        delay = min(self.config.base_delay * (2 ** attempt), self.config.max_delay)
-        if self.config.jitter:
-            delay = delay * (0.5 + random.random())  # jitter: 50-100% of delay
-        return delay
-
-# ============================================================================
-# Audit Sink (Immutable Log)
-# ============================================================================
-
-@dataclass
-class AuditEvent:
-    timestamp: str
-    trace_id: str
-    span_id: str
-    event_type: str  # "policy_decision", "tool_call", "approval"
-    user_id: Optional[str]
-    action: str
-    args_redacted: Dict[str, Any]
-    result_summary: str
-    decision: str  # "allow", "deny"
-
-    def to_json(self) -> str:
-        return json.dumps({
-            "timestamp": self.timestamp,
-            "trace_id": self.trace_id,
-            "span_id": self.span_id,
-            "event_type": self.event_type,
-            "user_id": self.user_id,
-            "action": self.action,
-            "args_redacted": self.args_redacted,
-            "result_summary": self.result_summary,
-            "decision": self.decision,
-        })
-
-class AuditSink:
-    """Append-only audit log (WORM)."""
-
-    def __init__(self, output_path: str = "audit.log"):
-        self.output_path = output_path
-
-    def write(self, event: AuditEvent):
-        """Write event to append-only log."""
-        with open(self.output_path, "a") as f:
-            f.write(event.to_json() + "\n")
-        logger.info(f"Audit event written: {event.event_type} {event.action} {event.decision}")
-
-# ============================================================================
-# Cost Tracking and Circuit Breaker
-# ============================================================================
-
-@dataclass
-class CostConfig:
-    max_cost_per_request: float = 0.10  # dollars
-    max_cost_per_hour: float = 100.0    # dollars
-    alert_threshold: float = 0.80       # 80% of max
-
-class CostTracker:
-    def __init__(self, config: CostConfig):
-        self.config = config
-        self.current_request_cost = 0.0
-        self.hourly_cost = 0.0
-        self.hourly_window_start = time.time()
-
-    def add_llm_call(self, input_tokens: int, output_tokens: int, model: str):
-        """Add cost for an LLM call."""
-        # Example pricing (Claude Sonnet 4.5)
-        price_per_input_million = 3.0
-        price_per_output_million = 15.0
-
-        cost = (input_tokens / 1_000_000 * price_per_input_million +
-                output_tokens / 1_000_000 * price_per_output_million)
-
-        self.current_request_cost += cost
-        self.hourly_cost += cost
-
-        # Check thresholds
-        if self.current_request_cost > self.config.max_cost_per_request:
-            raise RuntimeError(f"Request cost ${self.current_request_cost:.4f} exceeds limit ${self.config.max_cost_per_request}")
-
-        # Reset hourly window if needed
-        if time.time() - self.hourly_window_start > 3600:
-            self.hourly_cost = cost
-            self.hourly_window_start = time.time()
-
-        if self.hourly_cost > self.config.max_cost_per_hour:
-            raise RuntimeError(f"Hourly cost ${self.hourly_cost:.2f} exceeds limit ${self.config.max_cost_per_hour}")
-
-        if self.current_request_cost > self.config.max_cost_per_request * self.config.alert_threshold:
-            logger.warning(f"Request cost ${self.current_request_cost:.4f} approaching limit")
-
-    def reset_request(self):
-        self.current_request_cost = 0.0
-
-# ============================================================================
-# Drift Detection
-# ============================================================================
-
-@dataclass
-class DriftConfig:
-    baseline_sample_size: int = 100
-    drift_threshold: float = 0.20  # 20% change triggers alert
-
-class DriftDetector:
-    """Detect LLM output drift over time."""
-
-    def __init__(self, config: DriftConfig):
-        self.config = config
-        self.baseline_outputs: List[str] = []
-        self.baseline_avg_length = 0.0
-
-    def add_baseline(self, output: str):
-        if len(self.baseline_outputs) < self.config.baseline_sample_size:
-            self.baseline_outputs.append(output)
-            if len(self.baseline_outputs) == self.config.baseline_sample_size:
-                self.baseline_avg_length = sum(len(o) for o in self.baseline_outputs) / len(self.baseline_outputs)
-                logger.info(f"Baseline established: avg_length={self.baseline_avg_length:.1f}")
-
-    def check_drift(self, output: str) -> bool:
-        """Returns True if drift detected."""
-        if not self.baseline_outputs:
-            return False
-
-        current_length = len(output)
-        drift = abs(current_length - self.baseline_avg_length) / self.baseline_avg_length
-
-        if drift > self.config.drift_threshold:
-            logger.warning(f"Drift detected: current_length={current_length}, baseline={self.baseline_avg_length:.1f}, drift={drift:.2%}")
-            return True
-        return False
-
-# ============================================================================
-# Telemetry Runtime (OTel Spans, Metrics, Tail Sampling)
-# ============================================================================
-
-class TelemetryRuntime:
-    """Production telemetry runtime with OTel."""
-
-    def __init__(self, service_name: str = "llm-agent"):
-        # Setup tracer
-        trace.set_tracer_provider(TracerProvider())
-        otlp_exporter = OTLPSpanExporter(endpoint="http://localhost:4317", insecure=True)
-        trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(otlp_exporter))
-        self.tracer = trace.get_tracer(service_name)
-
-        # Setup metrics
-        metric_reader = PeriodicExportingMetricReader(
-            OTLPMetricExporter(endpoint="http://localhost:4317", insecure=True),
-            export_interval_millis=30000  # 30s
+    def start_span(
+        self,
+        name: str,
+        *,
+        parent: Span | None = None,
+        attributes: dict | None = None,
+    ) -> Span:
+        span = Span(
+            name=name,
+            trace_id=parent.trace_id if parent else uuid.uuid4().hex,
+            parent_id=parent.span_id if parent else None,
         )
-        metrics.set_meter_provider(MeterProvider(metric_readers=[metric_reader]))
-        self.meter = metrics.get_meter(service_name)
-
-        # Metrics
-        self.llm_call_counter = self.meter.create_counter(
-            "llm.calls.total",
-            description="Total LLM API calls"
-        )
-        self.llm_token_counter = self.meter.create_counter(
-            "llm.tokens.total",
-            description="Total tokens processed"
-        )
-        self.llm_cost_counter = self.meter.create_counter(
-            "llm.cost.usd",
-            description="Total LLM cost in USD"
-        )
-        self.llm_latency_histogram = self.meter.create_histogram(
-            "llm.latency.seconds",
-            description="LLM call latency"
-        )
-
-        # PII redactor
-        self.pii_redactor = PIIRedactor(mode="replace")
-        self.pii_verifier = PIIVerifier(sample_rate=0.01)
-
-        # Audit sink
-        self.audit_sink = AuditSink()
-
-        # Cost tracker
-        self.cost_tracker = CostTracker(CostConfig())
-
-        # Drift detector
-        self.drift_detector = DriftDetector(DriftConfig())
-
-    def create_span(self, name: str, attributes: Dict[str, Any] = None) -> trace.Span:
-        """Create a new span with OTel GenAI attributes."""
-        span = self.tracer.start_span(name)
         if attributes:
-            for key, value in attributes.items():
-                span.set_attribute(key, value)
+            for k, v in attributes.items():
+                span.set_attribute(k, v)
+        self.spans.append(span)
         return span
 
-    def record_llm_call(
-        self,
-        model: str,
-        input_tokens: int,
-        output_tokens: int,
-        latency: float,
-        finish_reason: str,
-        prompt: str,
-        completion: str,
-        trace_id: str,
-        span_id: str,
-    ):
-        """Record LLM call with metrics, redaction, audit."""
-        # Metrics
-        self.llm_call_counter.add(1, {"model": model, "finish_reason": finish_reason})
-        self.llm_token_counter.add(input_tokens, {"model": model, "type": "input"})
-        self.llm_token_counter.add(output_tokens, {"model": model, "type": "output"})
-        self.llm_latency_histogram.record(latency, {"model": model})
 
-        # Cost
-        self.cost_tracker.add_llm_call(input_tokens, output_tokens, model)
+def create_llm_span(tracer: Tracer, *, model: str, parent: Span | None = None) -> Span:
+    """Create an OTel-GenAI-convention span for an LLM call.
 
-        # PII redaction
-        redacted_prompt, _ = self.pii_redactor.redact(prompt)
-        redacted_completion, _ = self.pii_redactor.redact(completion)
-        self.pii_verifier.verify(redacted_completion)
-
-        # Drift detection
-        self.drift_detector.check_drift(completion)
-
-        # Audit log (if consequential)
-        if "policy" in prompt.lower() or "approve" in prompt.lower():
-            event = AuditEvent(
-                timestamp=datetime.now(timezone.utc).isoformat(),
-                trace_id=trace_id,
-                span_id=span_id,
-                event_type="llm_call",
-                user_id=None,
-                action="generate",
-                args_redacted={"prompt_length": len(prompt), "model": model},
-                result_summary=f"output_tokens={output_tokens}, finish_reason={finish_reason}",
-                decision="allow"
-            )
-            self.audit_sink.write(event)
-
-# ============================================================================
-# Example Usage
-# ============================================================================
-
-def example_llm_call_with_observability():
-    """Example: LLM call with full observability stack."""
-    runtime = TelemetryRuntime(service_name="example-agent")
-
-    # Create root span
-    with runtime.create_span(
-        "agent.workflow",
+    Key convention: span name = '{operation} {model}'.
+    Required attributes: gen_ai.provider.name, gen_ai.operation.name,
+    gen_ai.request.model.  Content is OFF by default in production.
+    """
+    span = tracer.start_span(
+        f"chat {model}",
+        parent=parent,
         attributes={
+            # --- required by OTel GenAI semantic conventions ---
+            "gen_ai.provider.name": model.split(":")[0] if ":" in model else "unknown",
             "gen_ai.operation.name": "chat",
-            "gen_ai.system": "anthropic",
-        }
-    ) as root_span:
-        trace_id = format(root_span.get_span_context().trace_id, '032x')
-        span_id = format(root_span.get_span_context().span_id, '016x')
+            "gen_ai.request.model": model,
+            # --- span kind CLIENT for outbound model call ---
+            "span.kind": "CLIENT",
+        },
+    )
+    return span
 
-        # Simulate LLM call
-        model = "claude-sonnet-4.5"
-        prompt = "What is the capital of France? My SSN is 123-45-6789."
 
-        start_time = time.time()
-        # (In real code, call Anthropic SDK here)
-        completion = "The capital of France is Paris."
-        input_tokens = 20
-        output_tokens = 10
-        latency = time.time() - start_time
-        finish_reason = "end_turn"
+# =============================================================================
+# --- Section 2: Custom Span Attributes (Tokens, Model, Cost) ----------------
+# =============================================================================
 
-        # Record with observability
-        runtime.record_llm_call(
-            model=model,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            latency=latency,
-            finish_reason=finish_reason,
-            prompt=prompt,
-            completion=completion,
-            trace_id=trace_id,
-            span_id=span_id,
-        )
+def record_llm_usage(
+    span: Span,
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cached_tokens: int = 0,
+    cost_usd: float,
+    finish_reason: str = "stop",
+) -> None:
+    """Attach token-usage and cost attributes to an LLM span.
 
-        root_span.set_status(Status(StatusCode.OK))
+    These are content-free metrics -- safe for 100% sampling and Prometheus
+    export.  Never put prompt text on a metric label (cardinality bomb).
+    """
+    span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
+    span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+    span.set_attribute("gen_ai.usage.cache_read_tokens", cached_tokens)
+    span.set_attribute("gen_ai.response.finish_reason", finish_reason)
+    # Cost is inferred, not a standard OTel attribute -- prefix with custom ns
+    span.set_attribute("app.cost_usd", cost_usd)
+    span.set_attribute("app.cost_formula", "input*rate + output*rate + cache_read*rate")
+    span.set_status("OK")
+    span.end()
 
-    logger.info("LLM call completed with full observability")
+
+# =============================================================================
+# --- Section 3: Trace Context Propagation Across Agent Steps ----------------
+# =============================================================================
+
+def new_traceparent() -> tuple[str, str, str]:
+    """Generate a W3C traceparent header.
+
+    Format: 00-{32 hex trace-id}-{16 hex span-id}-{2 hex flags}
+    Flag 01 = sampled (head hint, not a tail decision).
+    """
+    trace_id = uuid.uuid4().hex          # 32 hex chars = 16 bytes
+    span_id = uuid.uuid4().hex[:16]      # 16 hex chars = 8 bytes
+    return f"00-{trace_id}-{span_id}-01", trace_id, span_id
+
+
+def inject_traceparent_into_mcp(params_meta: dict, traceparent: str) -> dict:
+    """Inject W3C trace context into MCP params._meta.
+
+    Per SEP-414 (MCP spec 2026-07-28): keys MUST be unprefixed --
+    'traceparent', 'tracestate', 'baggage'.  DNS-prefixing breaks traces.
+    """
+    params_meta["traceparent"] = traceparent
+    # tracestate is optional; carries vendor-specific key=value pairs
+    # params_meta["tracestate"] = "myvendor=abc123"
+    return params_meta
+
+
+def propagate_across_agent_steps(tracer: Tracer) -> list[Span]:
+    """Demonstrate trace propagation: root agent -> tool -> nested LLM call.
+
+    In production the root span is 'invoke_agent {name}', tool spans are
+    'execute_tool {tool_name}', and nested LLM calls are 'chat {model}'.
+    All share the same trace_id via W3C traceparent on the wire.
+    """
+    # Root: the agent invocation
+    root = tracer.start_span("invoke_agent support-bot", attributes={
+        "gen_ai.operation.name": "invoke_agent",
+        "span.kind": "SERVER",
+    })
+
+    # Step 1: LLM decides to call a tool
+    llm_plan = create_llm_span(tracer, model="anthropic:claude-sonnet-4", parent=root)
+    record_llm_usage(llm_plan, input_tokens=800, output_tokens=120,
+                     cost_usd=0.0034)
+
+    # Step 2: Tool execution (e.g., database lookup)
+    tool_span = tracer.start_span("execute_tool crm_lookup", parent=root, attributes={
+        "gen_ai.operation.name": "execute_tool",
+        "gen_ai.tool.name": "crm_lookup",
+        "span.kind": "INTERNAL",
+    })
+    # Propagate traceparent to MCP / downstream service
+    tp, _, _ = new_traceparent()
+    inject_traceparent_into_mcp({"_meta": {}}, tp)
+    tool_span.set_status("OK")
+    tool_span.end()
+
+    # Step 3: Second LLM call with tool result
+    llm_final = create_llm_span(tracer, model="anthropic:claude-sonnet-4", parent=root)
+    record_llm_usage(llm_final, input_tokens=1200, output_tokens=250,
+                     cached_tokens=800, cost_usd=0.0051)
+
+    root.set_status("OK")
+    root.end()
+
+    return tracer.spans
+
+
+# =============================================================================
+# --- Section 4: Tail Sampling Decision Logic --------------------------------
+# =============================================================================
+
+@dataclass
+class TraceTree:
+    """A completed trace tree ready for a tail-sampling decision."""
+    trace_id: str
+    root_span: Span
+    spans: list[Span]
+    has_error: bool = False
+    has_content_filter: bool = False
+    has_hitl: bool = False
+    total_latency_ms: float = 0.0
+    total_tokens: int = 0
+
+
+def tail_sampling_decision(tree: TraceTree, *, latency_threshold_ms: float = 60_000) -> bool:
+    """Decide whether to keep a trace tree after it completes.
+
+    Agent default = tail sampling.  Head sampling decides before tools or
+    finish_reason -- wrong for agents because the interesting bit is only
+    known at the tail.
+
+    Policy stack (order matters -- first match wins):
+      1. Keep all errors / content_filter / policy-deny / HITL
+      2. Keep high-latency roots (above p95 threshold)
+      3. Rate-limit / bytes cap under overload (not shown)
+      4. Probabilistic remainder (e.g., 10% of happy paths)
+      5. SDK head sample only as last-ditch if collectors saturated
+    """
+    # Rule 1: Always keep error / policy / safety / HITL traces
+    if tree.has_error:
+        return True
+    if tree.has_content_filter:
+        return True
+    if tree.has_hitl:
+        return True
+
+    # Rule 2: Keep high-latency roots (slow agents often reveal issues)
+    if tree.total_latency_ms > latency_threshold_ms:
+        return True
+
+    # Rule 4: Probabilistic remainder -- keep 10% of normal traces
+    # In production this is the tailsamplingprocessor probabilistic policy
+    if random.random() < 0.10:
+        return True
+
+    return False  # Drop -- metrics (L1) and audit (L3) are unaffected
+
+
+# =============================================================================
+# --- Section 5: Cost Tracking Decorator -------------------------------------
+# =============================================================================
+
+# Published rates per million tokens (2026 illustrative)
+MODEL_RATES = {
+    "anthropic:claude-sonnet-4": {"input": 3.0, "output": 15.0, "cache_read": 0.30},
+    "anthropic:claude-haiku-4.5": {"input": 1.0, "output": 5.0, "cache_read": 0.10},
+    "openai:gpt-5.5":           {"input": 2.0, "output": 12.0, "cache_read": 0.20},
+}
+
+# Thread-safe accumulator for cost tracking across calls
+_cost_lock = threading.Lock()
+_cost_ledger: dict[str, float] = {}  # tenant -> total cost
+
+
+def compute_cost(model: str, input_tokens: int, output_tokens: int,
+                 cached_tokens: int = 0) -> float:
+    """Compute cost in USD for a single LLM call.
+
+    Observable run cost ~= model_input + cached_read + output
+                          + tool/retrieval surcharges
+                          + trace/checkpoint persistence overhead
+                          + eval LLM-as-judge cost (if online)
+    """
+    rates = MODEL_RATES.get(model, {"input": 5.0, "output": 25.0, "cache_read": 0.50})
+    # Cached tokens are a subset of input_tokens in most APIs
+    uncached = max(0, input_tokens - cached_tokens)
+    cost = (
+        (uncached / 1_000_000) * rates["input"]
+        + (cached_tokens / 1_000_000) * rates["cache_read"]
+        + (output_tokens / 1_000_000) * rates["output"]
+    )
+    return round(cost, 6)
+
+
+def track_cost(model: str, tenant: str = "default"):
+    """Decorator that automatically tracks cost of any function returning
+    a dict with 'input_tokens', 'output_tokens', and optionally 'cached_tokens'.
+
+    Usage:
+        @track_cost("anthropic:claude-sonnet-4", tenant="acme")
+        def call_llm(prompt): ...
+    """
+    def decorator(fn: Callable) -> Callable:
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            result = fn(*args, **kwargs)
+            cost = compute_cost(
+                model,
+                result.get("input_tokens", 0),
+                result.get("output_tokens", 0),
+                result.get("cached_tokens", 0),
+            )
+            result["cost_usd"] = cost
+            with _cost_lock:
+                _cost_ledger[tenant] = _cost_ledger.get(tenant, 0.0) + cost
+            return result
+        return wrapper
+    return decorator
+
+
+# Example usage of the decorator
+@track_cost("anthropic:claude-sonnet-4", tenant="acme")
+def fake_llm_call(prompt: str) -> dict:
+    """Simulate an LLM call returning token counts."""
+    return {
+        "response": f"Answer to: {prompt[:30]}...",
+        "input_tokens": 800,
+        "output_tokens": 150,
+        "cached_tokens": 600,
+    }
+
+
+# =============================================================================
+# --- Section 6: Alert / SLO Checker (Burn-Rate) -----------------------------
+# =============================================================================
+
+@dataclass
+class SLOConfig:
+    """Configuration for a burn-rate SLO.
+
+    For a 30-day, 99.9% SLO:
+      Page:   1h long / 5m short  at burn rate 14.4  (2% budget consumed)
+      Page:   6h long / 30m short at burn rate 6.0   (5% budget consumed)
+      Ticket: 3d long / 6h short  at burn rate 1.0   (10% budget consumed)
+
+    Short window = 1/12 of long.  Multiwindow AND: fire only if BOTH
+    windows exceed so the alert resets when burn stops.
+    """
+    slo_target: float = 0.999           # 99.9%
+    budget_window_days: int = 30
+    long_window_minutes: int = 60       # 1 hour
+    short_window_minutes: int = 5       # 5 minutes
+    burn_rate_threshold: float = 14.4   # page-level severity
+
+
+def check_burn_rate(
+    config: SLOConfig,
+    *,
+    long_window_error_rate: float,
+    short_window_error_rate: float,
+) -> dict:
+    """Evaluate whether the current error burn rate should trigger an alert.
+
+    Burn rate = actual_error_rate / allowed_error_rate.
+    Multiwindow AND: both long AND short must exceed threshold.
+    This prevents alerting on a brief spike that already stopped.
+    """
+    allowed_error_rate = 1.0 - config.slo_target  # 0.001 for 99.9%
+
+    long_burn = long_window_error_rate / allowed_error_rate if allowed_error_rate > 0 else 0
+    short_burn = short_window_error_rate / allowed_error_rate if allowed_error_rate > 0 else 0
+
+    # Multiwindow AND: fire only if both windows exceed
+    should_alert = (
+        long_burn >= config.burn_rate_threshold
+        and short_burn >= config.burn_rate_threshold
+    )
+
+    return {
+        "should_alert": should_alert,
+        "severity": "page" if config.burn_rate_threshold >= 6.0 else "ticket",
+        "long_burn_rate": round(long_burn, 2),
+        "short_burn_rate": round(short_burn, 2),
+        "threshold": config.burn_rate_threshold,
+        "budget_consumed_pct": round(
+            long_burn * (config.long_window_minutes / (config.budget_window_days * 24 * 60)) * 100, 2
+        ),
+    }
+
+
+# =============================================================================
+# --- Section 7: PII Pipeline (Detect -> Redact -> Audit) --------------------
+# =============================================================================
+# PII must be handled BEFORE export.  Three layers:
+#   L1 SDK (pre-serialization) -- primary control
+#   L2 OTel Collector (redaction processor) -- central policy
+#   L3 Backend (last resort) -- post-hoc, has a raw PII window
+
+EMAIL_RE = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9.-]+")
+SSN_RE   = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+PHONE_RE = re.compile(r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b")
+
+
+class PiiPipeline:
+    """Detect -> redact -> audit.  Never logs raw PII values.
+
+    If the classifier is down: fail closed on content export
+    (still serve the user; still emit metrics + redacted metadata).
+    """
+
+    def __init__(self) -> None:
+        self.audit_log: list[dict] = []
+
+    def apply(self, text: str, *, trace_id: str = "", tenant: str = "") -> str:
+        pre_sha = hashlib.sha256(text.encode()).hexdigest()[:16]
+        detected: dict[str, int] = {}
+
+        for name, pattern in [("EMAIL", EMAIL_RE), ("SSN", SSN_RE), ("PHONE", PHONE_RE)]:
+            hits = len(pattern.findall(text))
+            if hits:
+                detected[name] = hits
+
+        # Redact to stable tokens so downstream can still correlate
+        redacted = text
+        for name, pattern in [("EMAIL", EMAIL_RE), ("SSN", SSN_RE), ("PHONE", PHONE_RE)]:
+            redacted = pattern.sub(
+                lambda m: f"[{name}_{hashlib.sha256(m.group().encode()).hexdigest()[:12]}]",
+                redacted,
+            )
+
+        post_sha = hashlib.sha256(redacted.encode()).hexdigest()[:16]
+
+        # Audit: log decisions (types + counts), never raw values
+        self.audit_log.append({
+            "type": "pii_decision",
+            "trace_id": trace_id,
+            "tenant": tenant,
+            "pre_sha": pre_sha,
+            "post_sha": post_sha,
+            "entity_types": detected,
+            "action": "tokenize" if detected else "none",
+        })
+
+        return redacted
+
+
+# =============================================================================
+# --- Section 8: Circuit Breaker for Telemetry Export -------------------------
+# =============================================================================
+# Telemetry failure must NEVER become a user 500.  Circuit-break the exporter.
+# Fallback chain: full content -> redacted/pointer -> metrics-only -> disk buffer.
+
+class CircuitState(str, Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+@dataclass
+class ExportCircuitBreaker:
+    """Fail-fast circuit breaker for telemetry export backends.
+
+    Independent breakers needed for: trace backend (Datadog/LangSmith/Tempo),
+    content blob store, metrics backend.  A Datadog timeout must not block
+    the user (bulkhead).
+    """
+    name: str
+    threshold: int = 5          # consecutive failures to trip
+    cooldown_s: float = 15.0    # seconds before half-open probe
+    _state: CircuitState = CircuitState.CLOSED
+    _failures: int = 0
+    _opened_at: float = 0.0
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def allow(self) -> bool:
+        with self._lock:
+            if self._state is CircuitState.CLOSED:
+                return True
+            if self._state is CircuitState.OPEN:
+                if time.monotonic() - self._opened_at >= self.cooldown_s:
+                    self._state = CircuitState.HALF_OPEN
+                    return True  # one probe allowed
+                return False
+            # HALF_OPEN: allow one probe
+            return True
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._failures = 0
+            self._state = CircuitState.CLOSED
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self._failures += 1
+            if self._failures >= self.threshold:
+                self._state = CircuitState.OPEN
+                self._opened_at = time.monotonic()
+
+
+# =============================================================================
+# --- Section 9: Telemetry Runtime (Three-Layer Export) -----------------------
+# =============================================================================
+
+class TelemetryRuntime:
+    """Production-shaped telemetry runtime with three never-shared layers.
+
+    L1: Metrics (100%, content-free) -- SLOs, token burn, cost
+    L2: Traces (tail-sampled, redacted) -- debug, trajectory UI
+    L3: Audit (never sampled, WORM) -- legal proof a tool ran
+    """
+
+    def __init__(self, hmac_key: bytes) -> None:
+        self.hmac_key = hmac_key
+        self.metrics: list[dict] = []        # L1
+        self.traces: list[dict] = []         # L2
+        self.audit: list[dict] = []          # L3
+        self.pii = PiiPipeline()
+        self.trace_breaker = ExportCircuitBreaker("traces")
+
+    def hash_user_id(self, user_id: str) -> str:
+        """HMAC user ID -- never put raw user IDs on metric labels."""
+        return hmac.new(self.hmac_key, user_id.encode(), hashlib.sha256).hexdigest()[:16]
+
+    def export_turn(
+        self,
+        *,
+        tenant: str,
+        trace_id: str,
+        tokens_in: int,
+        tokens_out: int,
+        latency_ms: float,
+        cost_usd: float,
+        tool_calls: list[dict],
+        prompt_text: str,
+    ) -> dict:
+        """Export a single agent turn across all three layers.
+
+        L1 metrics always succeed (content-free).
+        L3 audit always succeeds (never sampled, never blocked by breaker).
+        L2 traces use circuit breaker with fallback.
+        """
+        # L1: Metrics -- always, 100%, content-free
+        self.metrics.append({
+            "tenant": tenant,
+            "trace_id": trace_id,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "latency_ms": latency_ms,
+            "cost_usd": cost_usd,
+        })
+
+        # L3: Audit -- always, never sampled, WORM
+        for tc in tool_calls:
+            args_hash = hashlib.sha256(
+                json.dumps(tc.get("args", {}), sort_keys=True).encode()
+            ).hexdigest()[:16]
+            self.audit.append({
+                "type": "tool_action",
+                "tenant": tenant,
+                "trace_id": trace_id,
+                "tool": tc["name"],
+                "args_sha": args_hash,
+                "policy": tc.get("policy", "allow"),
+            })
+
+        # L2: Traces -- redacted, circuit-breaker-protected
+        redacted = self.pii.apply(prompt_text, trace_id=trace_id, tenant=tenant)
+
+        if self.trace_breaker.allow():
+            try:
+                # In production: OTLP export to Tempo / Honeycomb / LangSmith
+                self.traces.append({"trace_id": trace_id, "content": redacted})
+                self.trace_breaker.record_success()
+                return {"status": "ok", "tier": "redacted_trace"}
+            except Exception:
+                self.trace_breaker.record_failure()
+
+        # Fallback: metrics-only -- user path never blocked
+        return {"status": "degraded", "tier": "metrics_only"}
+
+
+# =============================================================================
+# --- Section 10: HMAC User Identity (Never as Metric Label) -----------------
+# =============================================================================
+
+def demonstrate_hmac_identity() -> None:
+    """HMAC user identity so raw user IDs never appear in traces.
+
+    The HMAC key lives on the server, NEVER in the trace or the model context.
+    """
+    key = b"server-secret-not-in-trace"
+    user_id = "user-12345"
+    hashed = hmac.new(key, user_id.encode(), hashlib.sha256).hexdigest()[:16]
+    # hashed is safe for trace attributes; raw user_id is not
+    assert len(hashed) == 16
+    assert user_id not in hashed
+
+
+# =============================================================================
+# --- Demo / Self-Test -------------------------------------------------------
+# =============================================================================
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    example_llm_call_with_observability()
+    # 1. Trace propagation across agent steps
+    tracer = Tracer("demo")
+    spans = propagate_across_agent_steps(tracer)
+    assert len(spans) == 4  # root + 2 LLM + 1 tool
+    assert all(s.trace_id == spans[0].trace_id for s in spans)
+    print(f"[Trace] {len(spans)} spans, same trace_id: {spans[0].trace_id[:12]}...")
+
+    # 2. W3C traceparent generation
+    tp, tid, sid = new_traceparent()
+    assert tp.startswith("00-")
+    assert len(tid) == 32
+    print(f"[Traceparent] {tp}")
+
+    # 3. Tail sampling
+    tree = TraceTree(trace_id=tid, root_span=spans[0], spans=spans,
+                     has_error=True, total_latency_ms=5000)
+    assert tail_sampling_decision(tree) is True  # error -> always keep
+    tree_ok = TraceTree(trace_id=tid, root_span=spans[0], spans=spans,
+                        total_latency_ms=1000)
+    # Happy path: probabilistic (may or may not keep)
+    print(f"[Sampling] Error trace kept: True, Happy path decision: "
+          f"{tail_sampling_decision(tree_ok)}")
+
+    # 4. Cost tracking
+    result = fake_llm_call("What is the refund policy?")
+    assert "cost_usd" in result
+    assert _cost_ledger["acme"] > 0
+    print(f"[Cost] Call cost: ${result['cost_usd']:.6f}, "
+          f"Tenant total: ${_cost_ledger['acme']:.6f}")
+
+    # 5. Burn-rate SLO check
+    slo = SLOConfig()  # 99.9%, 1h/5m, burn_rate 14.4
+    alert = check_burn_rate(slo, long_window_error_rate=0.02,
+                            short_window_error_rate=0.025)
+    print(f"[SLO] Should alert: {alert['should_alert']}, "
+          f"Long burn: {alert['long_burn_rate']}x, "
+          f"Short burn: {alert['short_burn_rate']}x")
+
+    # 6. PII pipeline
+    pii = PiiPipeline()
+    redacted = pii.apply("Contact ada@example.com or 555-123-4567",
+                         trace_id="abc", tenant="acme")
+    assert "ada@example.com" not in redacted
+    assert "[EMAIL_" in redacted
+    print(f"[PII] Redacted: {redacted}")
+
+    # 7. Full telemetry runtime
+    rt = TelemetryRuntime(b"server-key")
+    export = rt.export_turn(
+        tenant="acme", trace_id=tid,
+        tokens_in=800, tokens_out=150, latency_ms=2400, cost_usd=0.004,
+        tool_calls=[{"name": "crm_lookup", "args": {"ticket": "T-9"}}],
+        prompt_text="Email ada@example.com about refund for SSN 123-45-6789",
+    )
+    assert export["status"] == "ok"
+    assert len(rt.metrics) == 1
+    assert len(rt.audit) >= 1
+    assert "ada@example.com" not in rt.traces[0]["content"]
+    print(f"[Runtime] Export: {export['status']}, "
+          f"Metrics: {len(rt.metrics)}, Audit: {len(rt.audit)}")
+
+    # 8. HMAC identity
+    demonstrate_hmac_identity()
+    print("[HMAC] User identity hashing verified.")
+
+    print("\nAll checks passed.")

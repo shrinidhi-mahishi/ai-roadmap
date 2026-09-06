@@ -1,47 +1,529 @@
 """
-Agent Feedback Loops - Code Examples
+Agent Feedback Loops -- Interview Prep Code Snippets
 
-Extracted from 06-agent-feedback-loops.md. Covers:
-- Production agent loop harness with hop caps, same_action_k detection,
-  circuit breaker on the critic, PII detect->redact->audit pipeline,
-  origin-tagged untrusted hints, idempotent tool keys, and structured
-  logging with correlation IDs.
-- Complete feedback loop pipeline (training side) including signal
-  capture, preference pair construction, DPO fine-tuning with
-  checkpointing, 4-set eval gate, self-reflection loop, training
-  circuit breaker, and staged rollout controller.
+Covers the four separated roles (planner, executor, critic, verifier), the
+self-correction loop (generate -> validate -> retry), reflection patterns,
+tool-error retry with backoff, human feedback integration, structured output
+validation, and feedback-driven prompt refinement.  All examples are
+self-contained with stub oracles and LLMs.
 """
+from __future__ import annotations
 
 import hashlib
 import json
 import logging
 import random
 import re
-import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from enum import Enum
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 
-# --- Section: Production Agent Loop with Hop Caps, Circuit Breaker, PII Pipeline ---
+# =============================================================================
+# --- Section 1: Self-Correction Loop (Generate -> Validate -> Retry) --------
+# =============================================================================
+# The canonical feedback loop:
+#   generate -> oracle/verifier -> pass? -> return
+#                                  fail? -> critic -> revise -> loop
+#
+# Key invariant: attach a critic ONLY when an oracle exists (tests, compiler,
+# DB predicate).  Huang (ICLR 2024): intrinsic self-correction (same model,
+# no oracle) DROPS accuracy.  GSM8K 75.9 -> 74.7 after two rounds.
 
-#!/usr/bin/env python3
-"""Agent feedback-loop harness: hop caps, same_action_k, critic fallback.
+@dataclass
+class Attempt:
+    """One trial in a feedback loop."""
+    output: str
+    oracle_pass: bool
+    oracle_logs: str = ""
+    reflection: str = ""
+    iteration: int = 0
 
-Stdlib only. Swap FakeOracle / FakeLlm for pytest and a provider SDK.
-# Optional: from langgraph.checkpoint.postgres import PostgresSaver
-# Optional: from temporalio import activity, workflow
-Run: python agent_feedback_loop.py
-"""
-from __future__ import annotations
 
-import hashlib, json, logging, random, re, threading, time, uuid
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Callable
+class FakeOracle:
+    """Deterministic verifier standing in for pytest / compiler / DB check.
+
+    In production, rank stoppers (total-order):
+      1. Deterministic env flag (AlfWorld done, HTTP 2xx, DB predicate)
+      2. Hidden tests
+      3. Replayable computation (interpreter, compiler, calculator)
+      4. PRM -- rerank, not stop, when 1-3 exist
+      5. LLM-as-judge / self-eval -- subjective quality only
+    If 1-3 exist, 4-5 must NOT override.
+    """
+    def __init__(self, pass_on_attempt: int = 2):
+        self.pass_on = pass_on_attempt
+
+    def check(self, output: str, attempt_num: int) -> tuple[bool, str]:
+        passed = attempt_num >= self.pass_on
+        logs = f"test_result={'PASS' if passed else 'FAIL'}; output_len={len(output)}"
+        return passed, logs
+
+
+class FakeLLM:
+    """Stub LLM for generating, critiquing, and revising."""
+
+    def generate(self, prompt: str, context: str = "") -> str:
+        return f"generated_answer(ctx={context[:20]})"
+
+    def critique(self, output: str, oracle_logs: str) -> str:
+        """Critic reads oracle logs, not the raw data that failed.
+
+        This is the key pattern -- the critic verbalizes WHY a trial failed,
+        based on structured test output, not by re-reading the input.
+        """
+        return f"hint: {oracle_logs}; try different approach"
+
+    def revise(self, output: str, reflection: str) -> str:
+        return f"revised({output[:20]}, reflection={reflection[:30]})"
+
+
+def self_correction_loop(
+    task: str,
+    *,
+    llm: FakeLLM,
+    oracle: FakeOracle,
+    max_iterations: int = 4,
+) -> list[Attempt]:
+    """Generate -> validate -> critique -> revise loop.
+
+    This is the Reflexion pattern (Shinn et al., NeurIPS 2023):
+      for trial in 1..T:
+        y = Actor(task, memory)
+        r = Env/Evaluator(y)
+        if oracle_pass(r): return y
+        z = Reflector(task, y, r)
+        memory.append(z)
+
+    HumanEval Python pass@1: 91.0% vs GPT-4 80.1% WITH tests.
+    WITHOUT tests on hardest 50 HumanEval-Rust: 52% vs 60% -- harmful.
+    """
+    attempts: list[Attempt] = []
+    context = ""
+
+    for i in range(max_iterations):
+        # Generate (or revise if we have a prior reflection)
+        if i == 0:
+            output = llm.generate(task)
+        else:
+            output = llm.revise(attempts[-1].output, attempts[-1].reflection)
+
+        # Validate with oracle
+        passed, logs = oracle.check(output, attempt_num=i + 1)
+
+        attempt = Attempt(
+            output=output,
+            oracle_pass=passed,
+            oracle_logs=logs,
+            iteration=i + 1,
+        )
+
+        if passed:
+            attempts.append(attempt)
+            break
+
+        # Critique: only fires on oracle fail
+        # No oracle, no critic -- this is Invariant I3
+        reflection = llm.critique(output, logs)
+        attempt.reflection = reflection
+        attempts.append(attempt)
+
+    return attempts
+
+
+# =============================================================================
+# --- Section 2: Reflection Pattern (Agent Critiques Its Own Output) ---------
+# =============================================================================
+# Self-Refine (Madaan et al., NeurIPS 2023): same LLM as INIT / FEEDBACK /
+# REFINE.  ~20% improvement over one-shot.  Best for style/fluency, NOT fact.
+# CRITIC (Gou et al.): critique backed by tools (search, interpreter).
+#   With tools:    ChatGPT HotpotQA F1 = 52.9
+#   Without tools: 46.1 (below ReAct at 50.2)
+# Critique without tools can be WORSE than no critique.
+
+@dataclass
+class ReflectionMemory:
+    """Episodic memory for reflections.  Cap at last 3 (Reflexion paper).
+
+    Memory is DATA, not instructions.  Store with origin=critic,
+    untrusted=true.  Never auto-promote web observations to semantic memory.
+    """
+    hints: list[dict] = field(default_factory=list)
+    max_size: int = 3
+
+    def add(self, reflection: str, oracle_hash: str) -> None:
+        self.hints.append({
+            "text": reflection,
+            "origin": "critic",          # who wrote it
+            "oracle_hash": oracle_hash,  # ties reflection to specific test failure
+            "untrusted": True,           # never treat as instructions
+        })
+        # Keep only the last N -- further reflections don't explore differently
+        self.hints = self.hints[-self.max_size:]
+
+    def get_context(self) -> str:
+        if not self.hints:
+            return ""
+        return "\n".join(
+            f"[Reflection {i+1}] {h['text']}" for i, h in enumerate(self.hints)
+        )
+
+
+class SelfRefineLoop:
+    """Self-Refine: generate -> feedback -> refine, same model, no tools.
+
+    Use ONLY for style/preference tasks.  For fact tasks, use CRITIC with
+    tools or Reflexion with tests.
+
+    Complexity: 2k+1 LLM calls for k iterations.
+    Cost multiplier vs single-pass: ~5x for 2 iterations.
+    """
+
+    def __init__(self, llm: FakeLLM, max_k: int = 4):
+        self.llm = llm
+        self.max_k = max_k
+
+    def run(self, task: str) -> dict:
+        output = self.llm.generate(task)
+        history = [{"stage": "init", "output": output}]
+
+        for k in range(self.max_k):
+            # Feedback: same model evaluates its own output
+            feedback = self.llm.critique(output, "style_check")
+
+            # Check if the model thinks it's good enough
+            if "looks good" in feedback.lower() or k == self.max_k - 1:
+                history.append({"stage": "final", "output": output, "k": k})
+                break
+
+            # Refine conditioned on feedback
+            output = self.llm.revise(output, feedback)
+            history.append({"stage": f"refine_{k+1}", "output": output})
+
+        return {"final_output": output, "iterations": len(history), "history": history}
+
+
+# =============================================================================
+# --- Section 3: Tool Error Retry with Backoff -------------------------------
+# =============================================================================
+# Transient tool errors (429, 503, network timeout) need jitter-based retry.
+# Permanent errors (4xx auth, schema mismatch) must NOT be retried.
+
+class TransientError(Exception):
+    """Retryable error (429, 503, timeout)."""
+    pass
+
+
+class PermanentError(Exception):
+    """Non-retryable error (4xx auth, schema mismatch, Cedar deny)."""
+    pass
+
+
+def retry_with_jitter(
+    fn: Callable,
+    *,
+    attempts: int = 4,
+    base_s: float = 0.05,
+    cap_s: float = 2.0,
+) -> Any:
+    """AWS-style full-jitter exponential backoff.
+
+    sleep = random(0, min(cap, base * 2^attempt))
+
+    Key points:
+    - Only retry TransientError; PermanentError propagates immediately
+    - Full jitter (not equal jitter) reduces thundering herd
+    - Always have a max attempts cap -- unbounded retry is a cost amplifier
+    """
+    last_error = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except PermanentError:
+            raise  # Never retry auth failures or schema mismatches
+        except TransientError as e:
+            last_error = e
+            if i < attempts - 1:
+                sleep_time = random.uniform(0, min(cap_s, base_s * (2 ** i)))
+                time.sleep(sleep_time)
+    raise last_error  # type: ignore[misc]
+
+
+class ToolExecutor:
+    """Execute a tool call with retry and circuit breaker awareness.
+
+    In production, map MCP isError:true to span status ERROR.
+    JSON-RPC 200 with isError:true is a lie -- RED metrics show 100%
+    healthy while the agent loops.
+    """
+
+    def __init__(self, fail_first_n: int = 2):
+        self.call_count = 0
+        self.fail_first_n = fail_first_n
+
+    def execute(self, tool_name: str, args: dict) -> dict:
+        self.call_count += 1
+        if self.call_count <= self.fail_first_n:
+            raise TransientError(f"{tool_name}: 429 rate limited")
+        return {"result": f"{tool_name}_ok", "args": args}
+
+    def execute_with_retry(self, tool_name: str, args: dict) -> dict:
+        return retry_with_jitter(
+            lambda: self.execute(tool_name, args),
+            attempts=4,
+            base_s=0.01,  # fast for demo
+        )
+
+
+# =============================================================================
+# --- Section 4: Human Feedback Integration ----------------------------------
+# =============================================================================
+# Human feedback sources (zero-annotation signals):
+#   - User edits (original=rejected, edit=chosen) -- highest signal
+#   - Implicit behavioral (retries, abandonment)
+#   - Thumbs up/down
+#   - Search/execution feedback (if verifiable)
+#
+# 73% of enterprise fine-tuning underperformance traces to DATA QUALITY,
+# not model selection or hyperparameters (Databricks 2025).
+
+@dataclass
+class FeedbackRecord:
+    """A single piece of human feedback on an agent output."""
+    request_id: str
+    original_output: str
+    feedback_type: str       # "edit" | "retry" | "thumbs_down" | "thumbs_up" | "abandon"
+    corrected_output: str = ""
+    timestamp: float = field(default_factory=time.time)
+
+
+class FeedbackCollector:
+    """Collect and route human feedback for downstream use.
+
+    Best practice: the highest signal-to-noise is REGENERATED and EDITED
+    events.  A user who clicked "try again" or rewrote the output is
+    indicating failure with zero survey friction.
+    """
+
+    def __init__(self) -> None:
+        self.records: list[FeedbackRecord] = []
+
+    def record_edit(self, request_id: str, original: str, edited: str) -> FeedbackRecord:
+        """User edited the output -- strongest signal.
+        Creates an implicit preference pair: (rejected=original, chosen=edited).
+        """
+        rec = FeedbackRecord(
+            request_id=request_id,
+            original_output=original,
+            feedback_type="edit",
+            corrected_output=edited,
+        )
+        self.records.append(rec)
+        return rec
+
+    def record_retry(self, request_id: str, original: str) -> FeedbackRecord:
+        """User clicked 'try again' -- implicit rejection."""
+        rec = FeedbackRecord(
+            request_id=request_id,
+            original_output=original,
+            feedback_type="retry",
+        )
+        self.records.append(rec)
+        return rec
+
+    def record_thumbs(self, request_id: str, output: str, up: bool) -> FeedbackRecord:
+        """Explicit thumbs up/down -- lower friction but noisier signal."""
+        rec = FeedbackRecord(
+            request_id=request_id,
+            original_output=output,
+            feedback_type="thumbs_up" if up else "thumbs_down",
+        )
+        self.records.append(rec)
+        return rec
+
+    def to_preference_pairs(self) -> list[dict]:
+        """Convert feedback into DPO-style preference pairs.
+
+        DPO is the 2026 default for alignment:
+          - Eliminates reward model and RL loop entirely
+          - Solves RLHF objective with classification loss on preference pairs
+          - Use GRPO when reward is verifiable (code passes tests)
+          - Use KTO when only unary signal exists (thumbs up only)
+        """
+        pairs = []
+        for rec in self.records:
+            if rec.feedback_type == "edit" and rec.corrected_output:
+                pairs.append({
+                    "prompt": rec.request_id,  # in real usage, the actual prompt
+                    "chosen": rec.corrected_output,
+                    "rejected": rec.original_output,
+                    "source": "user_edit",
+                })
+        return pairs
+
+
+# =============================================================================
+# --- Section 5: Output Validation (Structured Output Checks) ----------------
+# =============================================================================
+# Structured outputs from LLMs must be validated BEFORE use.
+# Common failure: model returns valid JSON that violates business constraints.
+
+@dataclass
+class ValidationResult:
+    valid: bool
+    errors: list[str] = field(default_factory=list)
+
+
+def validate_structured_output(
+    output: dict,
+    *,
+    required_fields: list[str],
+    field_types: dict[str, type] | None = None,
+    custom_checks: list[Callable[[dict], str | None]] | None = None,
+) -> ValidationResult:
+    """Validate LLM-generated structured output against a schema.
+
+    Three levels of validation:
+      1. Schema: required fields present, correct types
+      2. Semantic: values make sense (e.g., price > 0, date in future)
+      3. Business: domain-specific rules (e.g., refund <= original amount)
+    """
+    errors: list[str] = []
+
+    # Level 1: Required fields
+    for f in required_fields:
+        if f not in output:
+            errors.append(f"missing required field: {f}")
+
+    # Level 1: Type checks
+    if field_types:
+        for fname, ftype in field_types.items():
+            if fname in output and not isinstance(output[fname], ftype):
+                errors.append(
+                    f"field '{fname}' expected {ftype.__name__}, "
+                    f"got {type(output[fname]).__name__}"
+                )
+
+    # Level 2+3: Custom business rules
+    if custom_checks:
+        for check in custom_checks:
+            error = check(output)
+            if error:
+                errors.append(error)
+
+    return ValidationResult(valid=len(errors) == 0, errors=errors)
+
+
+def validate_and_retry(
+    generate_fn: Callable[[], dict],
+    *,
+    required_fields: list[str],
+    field_types: dict[str, type] | None = None,
+    custom_checks: list[Callable[[dict], str | None]] | None = None,
+    max_retries: int = 3,
+) -> tuple[dict | None, list[ValidationResult]]:
+    """Generate structured output, validate, and retry on failure.
+
+    This is the structured-output variant of the self-correction loop.
+    On each failure, the validation errors are fed back as context for
+    the next generation attempt.
+    """
+    results: list[ValidationResult] = []
+
+    for attempt in range(max_retries):
+        output = generate_fn()
+        result = validate_structured_output(
+            output,
+            required_fields=required_fields,
+            field_types=field_types,
+            custom_checks=custom_checks,
+        )
+        results.append(result)
+
+        if result.valid:
+            return output, results
+
+        # In production: feed result.errors back into the prompt for retry
+        # e.g., "Previous output had errors: {result.errors}. Fix and retry."
+
+    return None, results
+
+
+# =============================================================================
+# --- Section 6: Feedback-Driven Prompt Refinement ---------------------------
+# =============================================================================
+# Using collected feedback to improve prompts over time.
+# This is the runtime equivalent of post-training alignment.
+
+class PromptRefiner:
+    """Refine prompts based on accumulated feedback patterns.
+
+    This is NOT intrinsic self-correction (which drops accuracy).
+    This uses external evidence (user edits, test results) to
+    improve the system prompt across sessions.
+
+    Production decision tree for post-training:
+      Has verifiable reward? -> SFT + GRPO
+      Unary signal only?     -> SFT + KTO
+      Multiple objectives?   -> SFT + full RLHF (PPO)
+      Default:               -> SFT + DPO
+    """
+
+    def __init__(self, base_prompt: str) -> None:
+        self.base_prompt = base_prompt
+        self.learned_rules: list[str] = []
+
+    def learn_from_feedback(self, feedback_records: list[FeedbackRecord]) -> list[str]:
+        """Extract patterns from feedback to add as prompt rules.
+
+        In production, this would use an LLM to analyze feedback clusters
+        and generate refined instructions.  Here we demonstrate the pattern.
+        """
+        new_rules: list[str] = []
+
+        # Count failure types
+        retries = sum(1 for r in feedback_records if r.feedback_type == "retry")
+        edits = sum(1 for r in feedback_records if r.feedback_type == "edit")
+        thumbs_down = sum(1 for r in feedback_records if r.feedback_type == "thumbs_down")
+
+        total = len(feedback_records)
+        if total == 0:
+            return new_rules
+
+        # If >30% retries, output format may be wrong
+        if retries / total > 0.3:
+            new_rules.append("Users frequently retry. Be more concise and direct.")
+
+        # If edits show a consistent pattern, extract it
+        edit_records = [r for r in feedback_records if r.feedback_type == "edit"]
+        if len(edit_records) >= 3:
+            new_rules.append(
+                f"Users edited {len(edit_records)} outputs. "
+                "Review common corrections and adjust style."
+            )
+
+        self.learned_rules.extend(new_rules)
+        return new_rules
+
+    def get_refined_prompt(self) -> str:
+        """Compose the refined prompt with learned rules appended."""
+        if not self.learned_rules:
+            return self.base_prompt
+
+        rules_section = "\n".join(f"- {r}" for r in self.learned_rules)
+        return f"{self.base_prompt}\n\nLearned guidelines:\n{rules_section}"
+
+
+# =============================================================================
+# --- Section 7: Agent Loop with Budget Fuses --------------------------------
+# =============================================================================
+# The harness owns hop caps, NOT the model.  Key caps:
+#   max_turns = 10 (OpenAI Agents SDK default)
+#   max_replans = 2-3 (on state, not built-in)
+#   same_action warn 3 / hard 5 (DeerFlow)
+#   maxBudgetUsd (Claude -- no default, MUST set)
 
 MAX_TURNS = 10
 MAX_REPLANS = 2
@@ -50,758 +532,253 @@ SAME_ACTION_HARD = 5
 MEMORY_CAP = 3
 
 
-class CorrelationFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        for k, d in (("correlation_id", "-"), ("tenant_id", "-"),
-                     ("trial_id", "-"), ("turn", "-")):
-            setattr(record, k, getattr(record, k, d))
-        return True
+def action_hash(tool: str, args: str) -> str:
+    """Hash a (tool, args) pair for same-action detection."""
+    return hashlib.sha256(f"{tool}|{args}".encode()).hexdigest()[:16]
 
 
-def configure_logging() -> logging.Logger:
-    logger = logging.getLogger("loop")
-    if logger.handlers:
-        return logger
-    h = logging.StreamHandler()
-    h.setFormatter(logging.Formatter(
-        '{"ts":"%(asctime)s","level":"%(levelname)s","cid":"%(correlation_id)s",'
-        '"tenant":"%(tenant_id)s","trial":"%(trial_id)s","turn":"%(turn)s",'
-        '"msg":"%(message)s"}'
-    ))
-    h.addFilter(CorrelationFilter())
-    logger.addHandler(h)
-    logger.setLevel(logging.INFO)
-    return logger
+@dataclass
+class LoopState:
+    """State for the feedback loop harness."""
+    goal: str
+    allowlist: frozenset[str]
+    plan: list[str] = field(default_factory=list)
+    memory: ReflectionMemory = field(default_factory=ReflectionMemory)
+    turns: int = 0
+    replans: int = 0
+    action_counts: dict[str, int] = field(default_factory=dict)
+    status: str = "running"
+    cost_usd: float = 0.0
 
 
-LOG = configure_logging()
+class AgentLoop:
+    """Production agent loop with four separated roles and budget fuses.
 
+    Roles (never fused):
+      Planner:   decompose objective into steps (structured output LLM)
+      Executor:  run one ready node (tool runtime, sandboxed code)
+      Critic:    verbalize why a trial failed (only on oracle fail)
+      Verifier:  accept/reject (tests, compiler, DB predicate)
 
-def slog(level: int, msg: str, *, cid: str, tenant: str, trial: str = "-",
-         turn: int | str = "-", **fields: object) -> None:
-    extra = {"correlation_id": cid, "tenant_id": tenant,
-             "trial_id": trial, "turn": str(turn)}
-    LOG.log(level, "%s %s", msg, json.dumps(fields, default=str), extra=extra)
+    The LLM is NOT the planner.  The planner is a function that emits
+    a plan data structure.
+    """
 
+    def __init__(
+        self,
+        oracle: FakeOracle,
+        llm: FakeLLM,
+    ) -> None:
+        self.oracle = oracle
+        self.llm = llm
 
-class TransientError(Exception):
-    """429, 5xx, timeout, circuit open -- retry idempotent tools / critic."""
+    def run(self, goal: str, allowlist: frozenset[str]) -> LoopState:
+        state = LoopState(goal=goal, allowlist=allowlist, plan=["search", "analyze", "answer"])
 
-
-class PermanentError(Exception):
-    """4xx auth, policy deny, hop cap -- do not retry."""
-
-
-class CircuitOpenError(TransientError):
-    pass
-
-
-def retry_with_jitter(
-    fn: Callable[[], object], *, cid: str, tenant: str, trial: str, op: str,
-    attempts: int = 4, base_s: float = 0.05, cap_s: float = 1.0,
-) -> object:
-    last: Exception | None = None
-    for i in range(attempts):
-        try:
-            return fn()
-        except PermanentError:
-            raise
-        except TransientError as exc:
-            last = exc
-            if i == attempts - 1:
+        while state.status == "running":
+            # --- Budget fuse: max_turns ---
+            if state.turns >= MAX_TURNS:
+                state.status = "refuse:max_turns"
                 break
-            sleep = random.uniform(0, min(cap_s, base_s * (2 ** i)))
-            slog(logging.WARNING, "retry", cid=cid, tenant=tenant, trial=trial,
-                 op=op, attempt=i + 1, sleep_s=round(sleep, 3), err=str(exc))
-            time.sleep(sleep)
-    assert last is not None
-    raise last
+
+            state.turns += 1
+            tool = state.plan[0] if state.plan else "search"
+
+            # --- PEP: tool must be in allowlist ---
+            if tool not in state.allowlist:
+                state.status = "refuse:pep_deny"
+                break
+
+            # --- Same-action detection (DeerFlow pattern) ---
+            key = action_hash(tool, f"goal={goal}")
+            state.action_counts[key] = state.action_counts.get(key, 0) + 1
+            if state.action_counts[key] >= SAME_ACTION_HARD:
+                state.status = "refuse:same_action_hard"
+                break
+            if state.action_counts[key] >= SAME_ACTION_WARN:
+                # Log warning but continue
+                pass
+
+            # --- Execute ---
+            output = self.llm.generate(f"{tool}({goal})")
+
+            # --- Verify (oracle first, always) ---
+            passed, logs = self.oracle.check(output, state.turns)
+
+            if passed:
+                state.status = "pass"
+                break
+
+            # --- Critic (only on oracle fail) ---
+            # No oracle, no critic -- Invariant I3
+            reflection = self.llm.critique(output, logs)
+            oracle_hash = hashlib.sha256(logs.encode()).hexdigest()[:16]
+            state.memory.add(reflection, oracle_hash)
+
+            # --- Replan ---
+            state.replans += 1
+            if state.replans > MAX_REPLANS:
+                state.status = "refuse:max_replans"
+                break
+
+            # Rotate plan (simple strategy; production uses DAG replanning)
+            if len(state.plan) > 1:
+                state.plan = state.plan[1:] + state.plan[:1]
+
+        return state
 
 
-class CircuitState(str, Enum):
+# =============================================================================
+# --- Section 8: Circuit Breaker for Critic API ------------------------------
+# =============================================================================
+# Independent breakers needed for: critic API, tool fleet, same_action_k,
+# max_replans, verifier disagreement.
+
+class CriticCircuitState(str, Enum):
     CLOSED = "closed"
     OPEN = "open"
     HALF_OPEN = "half_open"
 
 
 @dataclass
-class CircuitBreaker:
-    name: str
-    failure_threshold: int = 5
+class CriticCircuitBreaker:
+    """Circuit breaker for the critic API.
+
+    Fallback chain: oracle critic (Haiku + tool/logs) -> skip critic
+    -> execute once -> deterministic refuse / HITL.
+    Never: skip oracle and keep the critic.
+    Never: verifier fail -> 'looks good, ship.'
+    """
+    threshold: int = 5
     cooldown_s: float = 15.0
-    half_open_probes: int = 1
-    _state: CircuitState = CircuitState.CLOSED
+    _state: CriticCircuitState = CriticCircuitState.CLOSED
     _failures: int = 0
     _opened_at: float = 0.0
-    _probes_used: int = 0
-    _lock: threading.Lock = field(default_factory=threading.Lock)
 
-    @property
-    def state(self) -> CircuitState:
-        return self._state
+    def allow(self) -> bool:
+        if self._state is CriticCircuitState.CLOSED:
+            return True
+        if self._state is CriticCircuitState.OPEN:
+            if time.monotonic() - self._opened_at >= self.cooldown_s:
+                self._state = CriticCircuitState.HALF_OPEN
+                return True
+            return False
+        return True  # HALF_OPEN: one probe
 
-    def allow(self) -> None:
-        with self._lock:
-            now = time.monotonic()
-            if self._state is CircuitState.OPEN:
-                if now - self._opened_at >= self.cooldown_s:
-                    self._state = CircuitState.HALF_OPEN
-                    self._probes_used = 0
-                else:
-                    raise CircuitOpenError(f"circuit_open:{self.name}")
-            if self._state is CircuitState.HALF_OPEN:
-                if self._probes_used >= self.half_open_probes:
-                    raise CircuitOpenError(f"circuit_half_open_busy:{self.name}")
-                self._probes_used += 1
-
-    def record_success(self) -> None:
-        with self._lock:
+    def record(self, success: bool) -> None:
+        if success:
             self._failures = 0
-            self._state = CircuitState.CLOSED
-            self._probes_used = 0
-
-    def record_failure(self) -> None:
-        with self._lock:
+            self._state = CriticCircuitState.CLOSED
+        else:
             self._failures += 1
-            if self._state is CircuitState.HALF_OPEN or \
-               self._failures >= self.failure_threshold:
-                self._state = CircuitState.OPEN
+            if self._failures >= self.threshold:
+                self._state = CriticCircuitState.OPEN
                 self._opened_at = time.monotonic()
 
 
-EMAIL_RE = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9.-]+")
-SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
-PHONE_RE = re.compile(r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b")
-PAN_RE = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
-
-
-@dataclass
-class RedactionResult:
-    text: str
-    types: dict[str, int]
-    pre_sha: str
-    post_sha: str
-
-    @property
-    def hit(self) -> bool:
-        return bool(self.types)
-
-
-class AuditSink:
-    def __init__(self) -> None:
-        self.rows: list[dict] = []
-        self._lock = threading.Lock()
-
-    def write(self, row: dict) -> None:
-        with self._lock:
-            self.rows.append(dict(row))
-
-
-class PiiPipeline:
-    """Detect -> redact -> audit. Never logs raw values."""
-
-    def __init__(self, audit: AuditSink) -> None:
-        self.audit = audit
-
-    def redact(self, text: str) -> RedactionResult:
-        pre = hashlib.sha256(text.encode()).hexdigest()
-        types = {n: len(rx.findall(text)) for n, rx in
-                 (("EMAIL", EMAIL_RE), ("SSN", SSN_RE),
-                  ("PHONE", PHONE_RE), ("PAN", PAN_RE))}
-        types = {k: v for k, v in types.items() if v}
-
-        def tok(prefix: str, m: re.Match[str]) -> str:
-            return f"[{prefix}_{hashlib.sha256(m.group(0).encode()).hexdigest()[:12]}]"
-
-        out = EMAIL_RE.sub(lambda m: tok("EMAIL", m), text)
-        out = SSN_RE.sub(lambda m: tok("SSN", m), out)
-        out = PHONE_RE.sub(lambda m: tok("PHONE", m), out)
-        out = PAN_RE.sub(lambda m: tok("PAN", m), out)
-        return RedactionResult(out, types, pre,
-                               hashlib.sha256(out.encode()).hexdigest())
-
-    def apply(self, text: str, **meta: str) -> RedactionResult:
-        result = self.redact(text)
-        self.audit.write({
-            "type": "pii_decision", "ts": time.time(), **meta,
-            "pre_sha": result.pre_sha, "post_sha": result.post_sha,
-            "types": result.types,
-            "action": "tokenize" if result.hit else "none",
-            "detector": "regex",
-        })
-        return result
-
-
-@dataclass
-class Hint:
-    text: str
-    origin: str
-    oracle_hash: str
-    untrusted: bool
-    actor: str
-
-
-@dataclass
-class LoopState:
-    goal: str
-    allowlist: frozenset[str]
-    s_ref: frozenset[str]
-    plan: list[str] = field(default_factory=list)
-    past_steps: list[str] = field(default_factory=list)
-    memory: list[Hint] = field(default_factory=list)
-    turns: int = 0
-    replans: int = 0
-    action_counts: dict[str, int] = field(default_factory=dict)
-    last_obs_hash: str = ""
-    status: str = "running"
-
-
-class FakeOracle:
-    """Deterministic verifier. $0 model. Prefer this over any critic."""
-
-    def __init__(self, pass_on_turn: int = 2) -> None:
-        self.pass_on_turn = pass_on_turn
-
-    def verdict(self, state: LoopState) -> tuple[bool, str]:
-        logs = (f"tests={'PASS' if state.turns >= self.pass_on_turn else 'FAIL'}"
-                f" turn={state.turns}")
-        return state.turns >= self.pass_on_turn, logs
-
-
-class FakeCritic:
-    """Oracle-log critic. Raises TransientError to exercise the breaker."""
-
-    def __init__(self, fail_times: int = 0) -> None:
-        self.fail_times = fail_times
-        self.calls = 0
-
-    def reflect(self, logs: str) -> str:
-        self.calls += 1
-        if self.calls <= self.fail_times:
-            raise TransientError("critic_429")
-        return f"hint: retry with a different tool; logs={logs[:80]}"
-
-
-def action_hash(tool: str, args: str) -> str:
-    return hashlib.sha256(f"{tool}|{args}".encode()).hexdigest()[:16]
-
-
-def pep_allows(state: LoopState, tool: str) -> bool:
-    return tool in state.allowlist and tool in state.s_ref
-
-
-class AgentLoop:
-    def __init__(self, oracle: FakeOracle, critic: FakeCritic,
-                 pii: PiiPipeline, critic_breaker: CircuitBreaker,
-                 audit: AuditSink) -> None:
-        self.oracle = oracle
-        self.critic = critic
-        self.pii = pii
-        self.critic_breaker = critic_breaker
-        self.audit = audit
-
-    def run(self, *, goal: str, tenant: str, cid: str,
-            allowlist: frozenset[str],
-            s_ref: frozenset[str]) -> LoopState:
-        trial = uuid.uuid4().hex[:12]
-        state = LoopState(goal=goal, allowlist=allowlist, s_ref=s_ref,
-                          plan=["lookup", "act"])
-        slog(logging.INFO, "trial_start", cid=cid, tenant=tenant,
-             trial=trial, max_turns=MAX_TURNS, max_replans=MAX_REPLANS)
-        while state.status == "running":
-            if state.turns >= MAX_TURNS:
-                state.status = "refuse_max_turns"
-                slog(logging.ERROR, "max_turns", cid=cid, tenant=tenant,
-                     trial=trial, turn=state.turns)
-                break
-            state.turns += 1
-            tool = state.plan[0] if state.plan else "lookup"
-            if not pep_allows(state, tool):
-                state.status = "refuse_pep"
-                slog(logging.ERROR, "pep_block", cid=cid, tenant=tenant,
-                     trial=trial, turn=state.turns, tool=tool)
-                break
-            key = action_hash(tool, f"trial={trial}")
-            state.action_counts[key] = state.action_counts.get(key, 0) + 1
-            n = state.action_counts[key]
-            if n >= SAME_ACTION_HARD:
-                state.status = "refuse_same_action"
-                slog(logging.ERROR, "same_action_hard", cid=cid,
-                     tenant=tenant, trial=trial, turn=state.turns, n=n)
-                break
-            if n >= SAME_ACTION_WARN:
-                slog(logging.WARNING, "same_action_warn", cid=cid,
-                     tenant=tenant, trial=trial, turn=state.turns, n=n)
-
-            def _exec() -> str:
-                return f"obs:{tool}:ok:{key}"
-
-            obs = retry_with_jitter(_exec, cid=cid, tenant=tenant,
-                                    trial=trial, op=f"tool:{tool}")
-            state.past_steps.append(str(obs))
-            ok, logs = self.oracle.verdict(state)
-            self.audit.write({
-                "type": "oracle_verdict", "ts": time.time(), "cid": cid,
-                "tenant": tenant, "trial": trial, "ok": ok,
-                "logs_sha": hashlib.sha256(logs.encode()).hexdigest(),
-            })
-            if ok:
-                state.status = "pass"
-                slog(logging.INFO, "oracle_pass", cid=cid, tenant=tenant,
-                     trial=trial, turn=state.turns)
-                break
-            hint = self._critic_fallback(
-                logs, cid=cid, tenant=tenant, trial=trial, turn=state.turns)
-            if hint is None:
-                state.status = "refuse_skip_critic"
-                slog(logging.ERROR, "refuse_after_skip_critic", cid=cid,
-                     tenant=tenant, trial=trial, turn=state.turns)
-                break
-            redacted = self.pii.apply(
-                hint, cid=cid, tenant=tenant, trial=trial,
-                origin="critic", actor="orchestrator",
-            )
-            if redacted.types.get("PAN"):
-                state.status = "refuse_pii"
-                slog(logging.ERROR, "pii_block_from_store", cid=cid,
-                     tenant=tenant, trial=trial, turn=state.turns)
-                break
-            state.memory.append(Hint(
-                text=redacted.text, origin="critic",
-                oracle_hash=hashlib.sha256(
-                    logs.encode()).hexdigest()[:16],
-                untrusted=True, actor="orchestrator",
-            ))
-            state.memory = state.memory[-MEMORY_CAP:]
-            self.audit.write({
-                "type": "lesson_write", "ts": time.time(), "cid": cid,
-                "tenant": tenant, "trial": trial, "origin": "critic",
-                "actor": "orchestrator", "untrusted": True,
-                "oracle_hash": state.memory[-1].oracle_hash,
-                "post_sha": redacted.post_sha,
-            })
-            state.replans += 1
-            if state.replans > MAX_REPLANS:
-                state.status = "refuse_max_replans"
-                slog(logging.ERROR, "max_replans", cid=cid,
-                     tenant=tenant, trial=trial, turn=state.turns,
-                     replans=state.replans)
-                break
-            if len(state.plan) > 1:
-                state.plan = state.plan[1:] + state.plan[:1]
-        slog(logging.INFO, "trial_end", cid=cid, tenant=tenant,
-             trial=trial, status=state.status, turns=state.turns,
-             replans=state.replans, hints=len(state.memory),
-             breaker=self.critic_breaker.state.value)
-        return state
-
-    def _critic_fallback(self, logs: str, *, cid: str, tenant: str,
-                         trial: str, turn: int) -> str | None:
-        """oracle critic -> skip critic -> caller refuses."""
-        try:
-            self.critic_breaker.allow()
-
-            def _call() -> str:
-                return self.critic.reflect(logs)
-
-            text = str(retry_with_jitter(
-                _call, cid=cid, tenant=tenant, trial=trial, op="critic"))
-            self.critic_breaker.record_success()
-            slog(logging.INFO, "critic_ok", cid=cid, tenant=tenant,
-                 trial=trial, turn=turn)
-            return text
-        except (TransientError, PermanentError) as exc:
-            self.critic_breaker.record_failure()
-            slog(logging.WARNING, "critic_skip", cid=cid, tenant=tenant,
-                 trial=trial, turn=turn, err=str(exc),
-                 breaker=self.critic_breaker.state.value)
-            return None
-
-
-def main() -> None:
-    audit = AuditSink()
-    pii = PiiPipeline(audit)
-    loop = AgentLoop(
-        oracle=FakeOracle(pass_on_turn=2),
-        critic=FakeCritic(fail_times=1),
-        pii=pii,
-        critic_breaker=CircuitBreaker("critic"),
-        audit=audit,
-    )
-    cid = uuid.uuid4().hex
-    state = loop.run(
-        goal="resolve ticket", tenant="acme", cid=cid,
-        allowlist=frozenset({"lookup", "act"}),
-        s_ref=frozenset({"lookup", "act"}),
-    )
-    assert state.status == "pass", state.status
-    assert state.turns == 2, state.turns
-    assert any(r["type"] == "lesson_write" for r in audit.rows)
-    assert any(r["type"] == "pii_decision" for r in audit.rows)
-    refuse = AgentLoop(
-        oracle=FakeOracle(pass_on_turn=99),
-        critic=FakeCritic(fail_times=99),
-        pii=pii,
-        critic_breaker=CircuitBreaker(
-            "critic", failure_threshold=1, cooldown_s=60),
-        audit=audit,
-    ).run(
-        goal="resolve ticket", tenant="acme", cid=cid,
-        allowlist=frozenset({"lookup"}),
-        s_ref=frozenset({"lookup"}),
-    )
-    assert refuse.status in {"refuse_skip_critic", "refuse_max_turns",
-                             "refuse_same_action", "refuse_max_replans"}
-    print(json.dumps({"pass_status": state.status,
-                      "refuse_status": refuse.status,
-                      "audit_rows": len(audit.rows)}, indent=2))
-
-
-# --- Section: Complete Feedback Loop Pipeline (Training Side) ---
-
-"""
-Production feedback loop: captures signals, constructs preference pairs,
-runs DPO fine-tuning with checkpointing, and gates deployment with 4-set eval.
-"""
-
-import json
-import time
-import logging
-import hashlib
-from enum import Enum
-from dataclasses import dataclass, field
-from typing import Optional
-from datetime import datetime, timezone
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
-)
-logger = logging.getLogger("feedback_loop")
-
-
-# -- Signal types --
-
-class SignalType(Enum):
-    THUMBS_UP = "thumbs_up"
-    THUMBS_DOWN = "thumbs_down"
-    USER_EDIT = "user_edit"
-    REGENERATION = "regeneration"
-    SESSION_ABANDON = "session_abandon"
-    TASK_COMPLETE = "task_complete"
-
-
-@dataclass
-class FeedbackSignal:
-    trace_id: str
-    signal_type: SignalType
-    original_output: str
-    corrected_output: Optional[str]  # present for USER_EDIT
-    timestamp: str = field(
-        default_factory=lambda: datetime.now(timezone.utc).isoformat()
-    )
-    user_id: str = ""
-    metadata: dict = field(default_factory=dict)
-
-    def to_preference_pair(self) -> Optional[dict]:
-        """Convert feedback signal to a DPO preference pair."""
-        if self.signal_type == SignalType.USER_EDIT and self.corrected_output:
-            return {
-                "prompt": self.metadata.get("prompt", ""),
-                "chosen": self.corrected_output,
-                "rejected": self.original_output,
-                "source": "user_edit",
-                "trace_id": self.trace_id,
-                "timestamp": self.timestamp,
-            }
-        if self.signal_type == SignalType.REGENERATION and self.corrected_output:
-            return {
-                "prompt": self.metadata.get("prompt", ""),
-                "chosen": self.corrected_output,
-                "rejected": self.original_output,
-                "source": "regeneration",
-                "trace_id": self.trace_id,
-                "timestamp": self.timestamp,
-            }
-        return None
-
-
-# -- Preference pair store --
-
-class PreferencePairStore:
-    """In-memory store; swap for Argilla/database in production."""
-
-    def __init__(self):
-        self._pairs: list[dict] = []
-        self._seen: set[str] = set()
-
-    def add(self, pair: dict) -> bool:
-        pair_hash = hashlib.sha256(
-            json.dumps(pair, sort_keys=True).encode()
-        ).hexdigest()
-        if pair_hash in self._seen:
-            logger.info("Duplicate pair skipped: %s", pair["trace_id"])
-            return False
-        self._seen.add(pair_hash)
-        self._pairs.append(pair)
-        logger.info(
-            "Pair added: source=%s trace=%s total=%d",
-            pair["source"], pair["trace_id"], len(self._pairs),
-        )
-        return True
-
-    def export_for_training(self, min_pairs: int = 500) -> list[dict]:
-        if len(self._pairs) < min_pairs:
-            logger.warning(
-                "Only %d pairs available (minimum %d). Skipping export.",
-                len(self._pairs), min_pairs,
-            )
-            return []
-        snapshot = list(self._pairs)
-        logger.info("Exported %d preference pairs for training.", len(snapshot))
-        return snapshot
-
-
-# -- Self-reflection loop --
-
-class SelfReflectionLoop:
-    """Generate-critique-revise loop with bounded iterations."""
-
-    def __init__(self, llm_call, evaluator, max_iterations: int = 3):
-        self._llm_call = llm_call
-        self._evaluator = evaluator
-        self._max_iterations = max_iterations
-
-    def run(self, prompt: str) -> dict:
-        best_output = None
-        best_score = -1.0
-
-        for iteration in range(self._max_iterations):
-            if iteration == 0:
-                output = self._llm_call(prompt)
-            else:
-                critique_prompt = (
-                    f"Original prompt: {prompt}\n"
-                    f"Previous attempt: {output}\n"
-                    f"Critique: {critique}\n"
-                    f"Revise the response addressing the critique."
-                )
-                output = self._llm_call(critique_prompt)
-
-            score = self._evaluator(prompt, output)
-            logger.info(
-                "Reflection iter=%d score=%.3f", iteration, score
-            )
-
-            if score > best_score:
-                best_score = score
-                best_output = output
-
-            if score >= 0.9:
-                logger.info("Score threshold met at iter=%d", iteration)
-                return {
-                    "output": best_output,
-                    "score": best_score,
-                    "iterations": iteration + 1,
-                }
-
-            critique = self._llm_call(
-                f"Critique this response for accuracy and completeness:\n"
-                f"Prompt: {prompt}\nResponse: {output}"
-            )
-
-        logger.info(
-            "Max iterations reached. Returning best (score=%.3f)", best_score
-        )
-        return {
-            "output": best_output,
-            "score": best_score,
-            "iterations": self._max_iterations,
-        }
-
-
-# -- Circuit breaker for training --
-
-class TrainingCircuitBreaker:
-    """Monitors training health and halts on anomalies."""
-
-    def __init__(
-        self,
-        max_kl_divergence: float = 15.0,
-        max_reward_zscore: float = 2.5,
-        min_eval_score: float = 0.6,
-    ):
-        self._max_kl = max_kl_divergence
-        self._max_reward_z = max_reward_zscore
-        self._min_eval = min_eval_score
-        self._reward_history: list[float] = []
-        self._halted = False
-        self._halt_reason = ""
-
-    def check_step(self, kl_div: float, reward: float, step: int) -> bool:
-        """Returns True if training should continue, False if halted."""
-        if self._halted:
-            return False
-
-        if kl_div > self._max_kl:
-            self._halt("KL divergence %.2f exceeds max %.2f at step %d"
-                        % (kl_div, self._max_kl, step))
-            return False
-
-        self._reward_history.append(reward)
-        if len(self._reward_history) >= 10:
-            mean = sum(self._reward_history) / len(self._reward_history)
-            variance = sum(
-                (r - mean) ** 2 for r in self._reward_history
-            ) / len(self._reward_history)
-            std = variance ** 0.5
-            if std > 0:
-                z_score = (reward - mean) / std
-                if abs(z_score) > self._max_reward_z:
-                    self._halt(
-                        "Reward z-score %.2f exceeds threshold at step %d "
-                        "(possible reward hacking)" % (z_score, step)
-                    )
-                    return False
-        return True
-
-    def check_eval(self, eval_scores: dict) -> bool:
-        """Check 4-set evaluation gate."""
-        for eval_name, score in eval_scores.items():
-            if score < self._min_eval:
-                self._halt(
-                    "Eval '%s' scored %.3f (below min %.3f)"
-                    % (eval_name, score, self._min_eval)
-                )
-                return False
-        logger.info("All eval sets passed: %s", eval_scores)
-        return True
-
-    def _halt(self, reason: str):
-        self._halted = True
-        self._halt_reason = reason
-        logger.error("TRAINING HALTED: %s", reason)
-
-    @property
-    def status(self) -> dict:
-        return {
-            "halted": self._halted,
-            "reason": self._halt_reason,
-            "steps_monitored": len(self._reward_history),
-        }
-
-
-# -- Staged rollout controller --
-
-class RolloutController:
-    """Progressive traffic shifting with automatic rollback."""
-
-    STAGES = [
-        {"name": "canary", "percent": 1,
-         "min_samples": 50, "auto_promote_hours": 24},
-        {"name": "early", "percent": 5,
-         "min_samples": 200, "auto_promote_hours": 48},
-        {"name": "ramp", "percent": 25,
-         "min_samples": 500, "auto_promote_hours": 72},
-        {"name": "full", "percent": 50,
-         "min_samples": 1000, "auto_promote_hours": 168},
-    ]
-
-    def __init__(self, quality_threshold: float = 0.85):
-        self._stage_idx = 0
-        self._quality_threshold = quality_threshold
-        self._promoted_at: Optional[float] = None
-        self._rolled_back = False
-
-    @property
-    def current_stage(self) -> dict:
-        if self._rolled_back:
-            return {"name": "rolled_back", "percent": 0}
-        return self.STAGES[self._stage_idx]
-
-    def record_quality(self, score: float, sample_count: int) -> str:
-        stage = self.STAGES[self._stage_idx]
-
-        if score < self._quality_threshold:
-            self._rolled_back = True
-            logger.error(
-                "ROLLBACK at stage '%s': quality %.3f < threshold %.3f",
-                stage["name"], score, self._quality_threshold,
-            )
-            return "rolled_back"
-
-        if sample_count < stage["min_samples"]:
-            return "collecting"
-
-        hours_elapsed = 0.0
-        if self._promoted_at:
-            hours_elapsed = (time.time() - self._promoted_at) / 3600
-
-        if (hours_elapsed >= stage["auto_promote_hours"]
-                or self._promoted_at is None):
-            if self._stage_idx < len(self.STAGES) - 1:
-                self._stage_idx += 1
-                self._promoted_at = time.time()
-                new_stage = self.STAGES[self._stage_idx]
-                logger.info(
-                    "Promoted to stage '%s' (%d%% traffic)",
-                    new_stage["name"], new_stage["percent"],
-                )
-                return f"promoted:{new_stage['name']}"
-            return "fully_deployed"
-
-        return "waiting"
-
-
-# -- Full pipeline orchestrator --
-
-class FeedbackLoopPipeline:
-    """Orchestrates the complete feedback-to-improvement loop."""
-
-    def __init__(self, llm_call, evaluator):
-        self.pair_store = PreferencePairStore()
-        self.circuit_breaker = TrainingCircuitBreaker()
-        self.rollout = RolloutController()
-        self.reflection = SelfReflectionLoop(llm_call, evaluator)
-
-    def ingest_feedback(self, signal: FeedbackSignal):
-        pair = signal.to_preference_pair()
-        if pair:
-            self.pair_store.add(pair)
-
-    def trigger_training(self) -> dict:
-        pairs = self.pair_store.export_for_training(min_pairs=500)
-        if not pairs:
-            return {"status": "insufficient_data"}
-
-        logger.info("Starting DPO training with %d pairs", len(pairs))
-
-        # Simulated training loop with circuit breaker monitoring
-        for step in range(100):
-            kl_div = 0.5 + step * 0.1   # simulated KL growth
-            reward = 0.7 + step * 0.005  # simulated reward
-            if not self.circuit_breaker.check_step(kl_div, reward, step):
-                return {
-                    "status": "halted",
-                    "details": self.circuit_breaker.status,
-                }
-
-        # 4-set evaluation gate
-        eval_scores = {
-            "task_holdout": 0.88,
-            "capability_drift": 0.92,
-            "safety_refusal": 0.95,
-            "production_arena": 0.86,
-        }
-        if not self.circuit_breaker.check_eval(eval_scores):
-            return {
-                "status": "eval_failed",
-                "details": self.circuit_breaker.status,
-            }
-
-        logger.info("Training complete. Beginning staged rollout.")
-        return {"status": "ready_for_rollout", "eval_scores": eval_scores}
-
+# =============================================================================
+# --- Demo / Self-Test -------------------------------------------------------
+# =============================================================================
 
 if __name__ == "__main__":
-    main()
+    llm = FakeLLM()
+    oracle = FakeOracle(pass_on_attempt=2)
+
+    # 1. Self-correction loop
+    attempts = self_correction_loop("write a sort function", llm=llm, oracle=oracle)
+    assert attempts[-1].oracle_pass is True
+    assert len(attempts) == 2  # fail on 1, pass on 2
+    print(f"[Self-Correction] Passed on attempt {len(attempts)}, "
+          f"reflections used: {sum(1 for a in attempts if a.reflection)}")
+
+    # 2. Reflection memory
+    memory = ReflectionMemory(max_size=3)
+    for i in range(5):
+        memory.add(f"reflection_{i}", f"hash_{i}")
+    assert len(memory.hints) == 3  # capped at 3
+    assert memory.hints[0]["text"] == "reflection_2"  # oldest kept
+    print(f"[Memory] {len(memory.hints)} reflections (capped at {memory.max_size})")
+
+    # 3. Self-Refine loop
+    refiner = SelfRefineLoop(llm, max_k=3)
+    result = refiner.run("write a product description")
+    print(f"[Self-Refine] Iterations: {result['iterations']}")
+
+    # 4. Tool error retry
+    executor = ToolExecutor(fail_first_n=2)
+    tool_result = executor.execute_with_retry("crm_lookup", {"id": 42})
+    assert tool_result["result"] == "crm_lookup_ok"
+    assert executor.call_count == 3  # failed 2, succeeded on 3
+    print(f"[Retry] Tool succeeded after {executor.call_count} attempts")
+
+    # 5. Human feedback collection and DPO pairs
+    collector = FeedbackCollector()
+    collector.record_edit("req-1", "verbose answer here", "concise answer")
+    collector.record_retry("req-2", "wrong format output")
+    collector.record_thumbs("req-3", "good answer", up=True)
+    pairs = collector.to_preference_pairs()
+    assert len(pairs) == 1  # only edits become preference pairs
+    assert pairs[0]["chosen"] == "concise answer"
+    print(f"[Feedback] {len(collector.records)} records, "
+          f"{len(pairs)} DPO preference pairs")
+
+    # 6. Structured output validation
+    good_output = {"action": "refund", "amount": 25.0, "currency": "USD"}
+    bad_output = {"action": "refund", "amount": -5.0}
+
+    def check_positive_amount(o: dict) -> str | None:
+        if o.get("amount", 0) <= 0:
+            return "amount must be positive"
+        return None
+
+    good_result = validate_structured_output(
+        good_output,
+        required_fields=["action", "amount", "currency"],
+        field_types={"amount": (int, float)},  # type: ignore
+        custom_checks=[check_positive_amount],
+    )
+    assert good_result.valid
+
+    bad_result = validate_structured_output(
+        bad_output,
+        required_fields=["action", "amount", "currency"],
+        custom_checks=[check_positive_amount],
+    )
+    assert not bad_result.valid
+    assert len(bad_result.errors) == 2  # missing currency + negative amount
+    print(f"[Validation] Good: {good_result.valid}, Bad errors: {bad_result.errors}")
+
+    # 7. Prompt refinement from feedback
+    refiner_prompt = PromptRefiner("You are a helpful assistant.")
+    collector2 = FeedbackCollector()
+    for _ in range(5):
+        collector2.record_retry(f"req-{_}", "bad output")
+    for _ in range(3):
+        collector2.record_edit(f"req-e{_}", "original", "edited")
+    new_rules = refiner_prompt.learn_from_feedback(collector2.records)
+    refined = refiner_prompt.get_refined_prompt()
+    assert "Learned guidelines" in refined
+    print(f"[Prompt Refine] Added {len(new_rules)} rules")
+
+    # 8. Full agent loop with budget fuses
+    loop = AgentLoop(oracle=FakeOracle(pass_on_attempt=2), llm=llm)
+    state = loop.run("resolve ticket T-42", frozenset({"search", "analyze", "answer"}))
+    assert state.status == "pass"
+    assert state.turns == 2
+    print(f"[Agent Loop] Status: {state.status}, turns: {state.turns}, "
+          f"replans: {state.replans}")
+
+    # Test refuse paths
+    never_pass = AgentLoop(oracle=FakeOracle(pass_on_attempt=99), llm=llm)
+    refused = never_pass.run("impossible task", frozenset({"search", "analyze", "answer"}))
+    assert refused.status.startswith("refuse:")
+    print(f"[Agent Loop] Refuse path: {refused.status}")
+
+    # 9. Critic circuit breaker
+    breaker = CriticCircuitBreaker(threshold=3)
+    for _ in range(3):
+        breaker.record(success=False)
+    assert not breaker.allow()  # circuit is open
+    print(f"[Circuit Breaker] State after 3 failures: {breaker._state.value}")
+
+    print("\nAll checks passed.")

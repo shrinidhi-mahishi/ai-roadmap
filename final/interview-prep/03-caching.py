@@ -1,761 +1,790 @@
 """
-Caching in LLM Systems - Code Examples
+Caching in LLM Systems -- Interview Prep Code Snippets.
 
-Covers: KV cache fundamentals, prefix caching (APC, RadixAttention),
-semantic caching, multi-tier cache architectures, cache-aware routing,
-hosted prompt caching (OpenAI, Anthropic, Gemini), stampede prevention
-(XFetch), cost analysis, tenant isolation, cache invalidation, and
-interview Q&A examples.
-
-Source: 03-caching.md
+Covers the five cache layers (KV, prefix/APC, hosted prompt cache, semantic,
+application), prompt caching patterns for Anthropic/OpenAI, semantic cache with
+embeddings, KV cache memory calculations, cache warming strategies, stampede
+prevention, invalidation patterns, and cost savings calculators.
 """
-
-# --- Shared imports across all code blocks ---
-import asyncio
-import hashlib
-import hmac
-import json
-import random
-import time
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
-
-
-# --- Section: APC (Automatic Prefix Caching) - vLLM ---
-# vLLM key parameters (CLI flags):
-# --enable-prefix-caching
-# --kv-cache-dtype fp8_e5m2  # Quantize to save memory
-# --cache-salt <string>       # Namespace for multi-tenant
-# --hash-algo sha256          # or sha256_cbor, xxhash
-
-
-# --- Section: Hosted Prompt Cache - Example (Anthropic) ---
-
-response = client.messages.create(
-    model="claude-3-5-sonnet-20241022",
-    system=[
-        {
-            "type": "text",
-            "text": "You are a customer support agent...",  # Cacheable
-            "cache_control": {"type": "ephemeral"}
-        }
-    ],
-    messages=[{"role": "user", "content": "How do I return an item?"}]
-)
-
-
-# --- Section: Skip RAG When Corpus Is Small ---
-
-system = """
-[Full docs]
-[Full catalog]
-You are a support agent. Use the above documentation to answer questions.
-"""  # Mark cacheable, 80k tokens
-
-# First request: pay 1.25x x 80k + 1x x query
-# Subsequent: pay 0.1x x 80k + 1x x query (87% savings on context)
-
-
-# --- Section: Production Multi-Tier Cache with Circuit Breakers (Grok Source) ---
+from __future__ import annotations
 
 import hashlib
 import hmac
 import json
-import redis
-import anthropic
-from dataclasses import dataclass
-from typing import Optional, Dict, Any
-from datetime import datetime, timedelta
-import openai
-
-@dataclass
-class CacheMetrics:
-    """Track cache performance."""
-    l1_hits: int = 0
-    l1_misses: int = 0
-    l2_hits: int = 0
-    l2_misses: int = 0
-    llm_calls: int = 0
-    total_requests: int = 0
-
-    def hit_rate(self) -> float:
-        hits = self.l1_hits + self.l2_hits
-        return hits / self.total_requests if self.total_requests > 0 else 0.0
-
-class CircuitBreaker:
-    """Simple circuit breaker for cache failures."""
-    def __init__(self, failure_threshold: int = 5, timeout: int = 60):
-        self.failure_threshold = failure_threshold
-        self.timeout = timeout
-        self.failures = 0
-        self.last_failure_time = None
-        self.state = "closed"  # closed, open, half_open
-
-    def call(self, func, *args, **kwargs):
-        if self.state == "open":
-            if datetime.now() - self.last_failure_time > timedelta(seconds=self.timeout):
-                self.state = "half_open"
-            else:
-                raise Exception("Circuit breaker OPEN")
-
-        try:
-            result = func(*args, **kwargs)
-            if self.state == "half_open":
-                self.state = "closed"
-                self.failures = 0
-            return result
-        except Exception as e:
-            self.failures += 1
-            self.last_failure_time = datetime.now()
-            if self.failures >= self.failure_threshold:
-                self.state = "open"
-            raise e
-
-class CacheRuntime:
-    """Production-grade multi-tier LLM cache with fallbacks."""
-
-    def __init__(
-        self,
-        redis_client: redis.Redis,
-        anthropic_client: anthropic.Anthropic,
-        openai_client: openai.OpenAI,
-        cache_salt: str,
-        semantic_threshold: float = 0.95,
-        l1_ttl: int = 3600,  # 1 hour
-        l2_ttl: int = 7200,  # 2 hours
-    ):
-        self.redis = redis_client
-        self.anthropic = anthropic_client
-        self.openai = openai_client
-        self.cache_salt = cache_salt
-        self.semantic_threshold = semantic_threshold
-        self.l1_ttl = l1_ttl
-        self.l2_ttl = l2_ttl
-        self.metrics = CacheMetrics()
-        self.l1_breaker = CircuitBreaker()
-        self.l2_breaker = CircuitBreaker()
-
-    def _canonical_hash(self, prompt: str, model: str) -> str:
-        """Compute HMAC-SHA256 hash with salt for cache key."""
-        # Canonical JSON ensures consistent ordering
-        canonical = json.dumps(
-            {"prompt": prompt, "model": model},
-            sort_keys=True,
-            separators=(',', ':')
-        )
-        return hmac.new(
-            self.cache_salt.encode(),
-            canonical.encode(),
-            hashlib.sha256
-        ).hexdigest()
-
-    def _l1_get(self, key: str) -> Optional[str]:
-        """L1: Exact match cache (Redis)."""
-        try:
-            return self.l1_breaker.call(self.redis.get, key)
-        except Exception:
-            return None
-
-    def _l1_set(self, key: str, value: str):
-        """Store in L1 with TTL."""
-        try:
-            self.l1_breaker.call(self.redis.setex, key, self.l1_ttl, value)
-        except Exception:
-            pass  # Silent fail on cache write
-
-    def _l2_search(self, prompt: str) -> Optional[tuple[str, float]]:
-        """L2: Semantic search (embedding + vector search)."""
-        try:
-            # Get embedding
-            embed_response = self.l2_breaker.call(
-                self.openai.embeddings.create,
-                model="text-embedding-3-small",
-                input=prompt
-            )
-            query_embedding = embed_response.data[0].embedding
-
-            # Search Redis vector index (assumes FT.SEARCH configured)
-            # Simplified: In production, use RedisVL or HNSW library
-            search_result = self.l2_breaker.call(
-                self.redis.execute_command,
-                "FT.SEARCH",
-                "semantic_cache_idx",
-                f"*=>[KNN 1 @embedding $vector AS score]",
-                "PARAMS", "2", "vector", query_embedding,
-                "RETURN", "2", "response", "score",
-                "DIALECT", "2"
-            )
-
-            if search_result and len(search_result) > 1:
-                score = float(search_result[2])  # Cosine similarity
-                if score >= self.semantic_threshold:
-                    response = search_result[1]
-                    return response, score
-            return None
-        except Exception:
-            return None
-
-    def _l2_set(self, prompt: str, response: str):
-        """Store in L2 semantic cache."""
-        try:
-            # Get embedding
-            embed_response = self.openai.embeddings.create(
-                model="text-embedding-3-small",
-                input=prompt
-            )
-            embedding = embed_response.data[0].embedding
-
-            # Store in Redis with vector (simplified)
-            key = f"semantic:{hashlib.sha256(prompt.encode()).hexdigest()}"
-            self.redis.hset(key, mapping={
-                "prompt": prompt,
-                "response": response,
-                "embedding": json.dumps(embedding)
-            })
-            self.redis.expire(key, self.l2_ttl)
-        except Exception:
-            pass
-
-    def _llm_call_with_prefix_cache(self, prompt: str, model: str) -> str:
-        """L3: Call LLM with prefix caching enabled."""
-        if "claude" in model:
-            # Anthropic: Use cache_control
-            response = self.anthropic.messages.create(
-                model=model,
-                max_tokens=1024,
-                system=[
-                    {
-                        "type": "text",
-                        "text": prompt,  # Simplified: should split stable prefix
-                        "cache_control": {"type": "ephemeral"}
-                    }
-                ],
-                messages=[{"role": "user", "content": "Continue"}]
-            )
-            return response.content[0].text
-        else:
-            # OpenAI: Use prompt_cache_key or structured format
-            response = self.openai.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                # Note: OpenAI auto-caches if prefix > 1024 tokens
-            )
-            return response.choices[0].message.content
-
-    def generate(
-        self,
-        prompt: str,
-        model: str,
-        use_semantic: bool = True,
-        use_exact: bool = True,
-    ) -> Dict[str, Any]:
-        """
-        Generate response with multi-tier cache fallback.
-
-        Returns:
-            {
-                "response": str,
-                "cache_level": "l1" | "l2" | "llm",
-                "latency_ms": float,
-            }
-        """
-        start = datetime.now()
-        self.metrics.total_requests += 1
-
-        # L1: Exact match
-        if use_exact:
-            cache_key = self._canonical_hash(prompt, model)
-            cached = self._l1_get(cache_key)
-            if cached:
-                self.metrics.l1_hits += 1
-                latency = (datetime.now() - start).total_seconds() * 1000
-                return {
-                    "response": cached,
-                    "cache_level": "l1",
-                    "latency_ms": latency,
-                }
-            self.metrics.l1_misses += 1
-
-        # L2: Semantic match
-        if use_semantic:
-            semantic_result = self._l2_search(prompt)
-            if semantic_result:
-                response, score = semantic_result
-                self.metrics.l2_hits += 1
-                latency = (datetime.now() - start).total_seconds() * 1000
-                return {
-                    "response": response,
-                    "cache_level": "l2",
-                    "semantic_score": score,
-                    "latency_ms": latency,
-                }
-            self.metrics.l2_misses += 1
-
-        # L3: LLM call with prefix cache
-        self.metrics.llm_calls += 1
-        response = self._llm_call_with_prefix_cache(prompt, model)
-        latency = (datetime.now() - start).total_seconds() * 1000
-
-        # Backfill caches
-        if use_exact:
-            self._l1_set(cache_key, response)
-        if use_semantic:
-            self._l2_set(prompt, response)
-
-        return {
-            "response": response,
-            "cache_level": "llm",
-            "latency_ms": latency,
-        }
-
-# Usage
-cache = CacheRuntime(
-    redis_client=redis.Redis(host="localhost", port=6379),
-    anthropic_client=anthropic.Anthropic(api_key="..."),
-    openai_client=openai.OpenAI(api_key="..."),
-    cache_salt="production-v1",
-)
-
-result = cache.generate(
-    prompt="What is your refund policy?",
-    model="claude-3-5-sonnet-20241022"
-)
-print(f"Response: {result['response']}")
-print(f"Cache level: {result['cache_level']}")
-print(f"Latency: {result['latency_ms']:.2f}ms")
-print(f"Cache hit rate: {cache.metrics.hit_rate():.2%}")
-
-
-# --- Section: Multi-Tier Cache with Request Coalescing (Opus Source) ---
-
-import asyncio
-import hashlib
-from typing import Optional, Dict
-from dataclasses import dataclass
-import time
-
-@dataclass
-class CacheEntry:
-    value: str
-    timestamp: float
-    ttl: int
-
-class XFetchCache:
-    """
-    Cache with XFetch pattern to prevent stampedes.
-    Only one request fetches; others wait for result.
-    """
-    def __init__(self):
-        self.cache: Dict[str, CacheEntry] = {}
-        self.in_flight: Dict[str, asyncio.Future] = {}
-        self.lock = asyncio.Lock()
-
-    async def get_or_fetch(
-        self,
-        key: str,
-        fetch_fn,
-        ttl: int = 3600
-    ) -> str:
-        """Get from cache or fetch, coalescing concurrent requests."""
-        now = time.time()
-
-        # Check cache
-        if key in self.cache:
-            entry = self.cache[key]
-            if now - entry.timestamp < entry.ttl:
-                return entry.value
-            else:
-                del self.cache[key]
-
-        # Check if another request is already fetching
-        async with self.lock:
-            if key in self.in_flight:
-                # Wait for in-flight request
-                return await self.in_flight[key]
-
-            # Start new fetch
-            future = asyncio.create_task(self._fetch_and_cache(key, fetch_fn, ttl))
-            self.in_flight[key] = future
-
-        try:
-            return await future
-        finally:
-            async with self.lock:
-                if key in self.in_flight:
-                    del self.in_flight[key]
-
-    async def _fetch_and_cache(self, key: str, fetch_fn, ttl: int) -> str:
-        """Fetch value and update cache."""
-        value = await fetch_fn()
-        self.cache[key] = CacheEntry(
-            value=value,
-            timestamp=time.time(),
-            ttl=ttl
-        )
-        return value
-
-class MultiTierLLMCache:
-    """
-    Production multi-tier cache with XFetch stampede prevention.
-    """
-    def __init__(
-        self,
-        redis_client,
-        llm_client,
-        l1_ttl: int = 3600,
-    ):
-        self.redis = redis_client
-        self.llm = llm_client
-        self.l1_ttl = l1_ttl
-        self.xfetch = XFetchCache()
-        self.metrics = {
-            "l1_hits": 0,
-            "l1_misses": 0,
-            "llm_calls": 0,
-            "coalesced_requests": 0,
-        }
-
-    def _hash_key(self, prompt: str, model: str) -> str:
-        """Generate cache key."""
-        canonical = f"{model}:{prompt}"
-        return hashlib.sha256(canonical.encode()).hexdigest()
-
-    async def _fetch_from_llm(self, prompt: str, model: str) -> str:
-        """Fetch from LLM (L3 with prefix cache)."""
-        self.metrics["llm_calls"] += 1
-        # Simplified: call LLM API
-        response = await self.llm.generate(prompt, model)
-        return response
-
-    async def generate(self, prompt: str, model: str) -> str:
-        """Generate with multi-tier cache."""
-        cache_key = self._hash_key(prompt, model)
-
-        # L1: Redis exact match
-        cached = self.redis.get(cache_key)
-        if cached:
-            self.metrics["l1_hits"] += 1
-            return cached.decode()
-
-        self.metrics["l1_misses"] += 1
-
-        # L2: XFetch with request coalescing
-        async def fetch():
-            return await self._fetch_from_llm(prompt, model)
-
-        response = await self.xfetch.get_or_fetch(cache_key, fetch, self.l1_ttl)
-
-        # Backfill L1
-        self.redis.setex(cache_key, self.l1_ttl, response)
-
-        return response
-
-# Usage
-async def main():
-    cache = MultiTierLLMCache(redis_client, llm_client)
-
-    # Simulate concurrent requests (stampede scenario)
-    tasks = [
-        cache.generate("What is AI?", "gpt-4")
-        for _ in range(100)  # 100 concurrent identical requests
-    ]
-
-    results = await asyncio.gather(*tasks)
-
-    print(f"LLM calls: {cache.metrics['llm_calls']}")  # Should be 1
-    print(f"Requests coalesced: {len(tasks) - cache.metrics['llm_calls']}")
-
-
-# --- Section: Cache-Aware Router (Opus Source) ---
-
-from typing import List, Dict
-from dataclasses import dataclass
+import math
 import random
+import threading
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Optional
 
-@dataclass
-class Instance:
-    id: str
-    endpoint: str
-    load: float  # 0.0 to 1.0
-    cached_prefixes: set  # Set of cached prefix hashes
 
-class CacheAwareRouter:
+# --- Prompt Caching: Anthropic/OpenAI Patterns ---
+
+@dataclass(frozen=True)
+class PromptParts:
+    """Structured prompt parts for cache-aware assembly.
+
+    Key design rule: stable content FIRST, volatile content LAST.
+    Tools, system prompts, few-shots BEFORE the breakpoint.
+    User queries, timestamps, per-request IDs AFTER it.
+
+    NEVER interpolate datetime.now() or UUIDs into the system prompt --
+    that invalidates the entire prefix cache on every request.
     """
-    Route requests to instances with warm cache.
-    Based on NVIDIA Dynamo approach.
+    model: str
+    tools: list              # Tool definitions (stable)
+    system: str              # System prompt (stable)
+    few_shots: list = field(default_factory=list)  # Few-shot examples (stable)
+    user_message: str = ""   # User query (volatile -- goes AFTER breakpoint)
+
+
+def canonical_json(obj) -> str:
+    """Deterministic JSON for cache key computation.
+
+    Sort keys, minimal separators. Tool order must be stable --
+    tool reorder changes the prefix hash and busts the cache.
     """
-    def __init__(self, instances: List[Instance]):
-        self.instances = instances
-
-    def _hash_prefix(self, prompt: str, prefix_len: int = 1024) -> str:
-        """Hash first N tokens of prompt as prefix."""
-        # Simplified: use first N chars as proxy for tokens
-        prefix = prompt[:prefix_len]
-        return hashlib.sha256(prefix.encode()).hexdigest()
-
-    def route(self, prompt: str) -> Instance:
-        """
-        Route to instance with best cache hit + load score.
-
-        Score = (cache_hit_score) x (1 - load)
-        """
-        prefix_hash = self._hash_prefix(prompt)
-
-        scores = []
-        for instance in self.instances:
-            # Cache hit score: 1.0 if cached, 0.0 if not
-            cache_hit = 1.0 if prefix_hash in instance.cached_prefixes else 0.0
-
-            # Combined score
-            score = cache_hit * (1 - instance.load)
-            scores.append((score, instance))
-
-        # Route to highest score
-        scores.sort(reverse=True, key=lambda x: x[0])
-
-        # If all scores are 0 (no cache hits), round-robin
-        if scores[0][0] == 0:
-            return random.choice(self.instances)
-
-        return scores[0][1]
-
-# Usage
-instances = [
-    Instance(id="a", endpoint="http://a:8000", load=0.3, cached_prefixes={"abc123"}),
-    Instance(id="b", endpoint="http://b:8000", load=0.7, cached_prefixes={"def456"}),
-    Instance(id="c", endpoint="http://c:8000", load=0.5, cached_prefixes=set()),
-]
-
-router = CacheAwareRouter(instances)
-
-prompt_with_cached_prefix = "..." # Hashes to "abc123"
-instance = router.route(prompt_with_cached_prefix)
-print(f"Routed to: {instance.id}")  # Should route to instance 'a'
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
 
 
-# --- Section: Build Cacheable Prompt (Opus Source) ---
+def build_anthropic_prompt(parts: PromptParts) -> dict:
+    """Build an Anthropic API request with cache_control breakpoints.
 
-from typing import List, Dict, Any
+    Anthropic render order: tools -> system -> messages.
+    Up to 4 cache_control breakpoints allowed.
 
-def build_cacheable_prompt(
-    tools: List[Dict[str, Any]],
-    system_instructions: str,
-    user_context: str,
-    query: str,
-    provider: str = "anthropic",
-) -> Dict[str, Any]:
+    Writes ONLY at the breakpoint. Reads look back at most 20 content blocks.
+    Below the floor (512-4096 tokens depending on model): SILENT NO-OP
+    (no error, cache fields = 0). Haiku 4.5 floor is 4096.
+
+    Cache read refreshes TTL at no cost. Continuous traffic keeps
+    5-min cache warm indefinitely.
     """
-    Build prompt with stable prefix for caching.
-
-    Structure:
-    [Tools] <- Cacheable
-    [System] <- Cacheable
-    [User context + query] <- Volatile
-    """
-    if provider == "anthropic":
-        # Anthropic: Use system blocks with cache_control
-        return {
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 1024,
-            "system": [
-                {
-                    "type": "text",
-                    "text": f"Available tools:\n{json.dumps(tools, indent=2)}",
-                    "cache_control": {"type": "ephemeral"}
-                },
-                {
-                    "type": "text",
-                    "text": system_instructions,
-                    "cache_control": {"type": "ephemeral"}
-                },
-            ],
-            "messages": [
-                {
-                    "role": "user",
-                    "content": f"{user_context}\n\nQuery: {query}"
-                }
-            ]
-        }
-    elif provider == "openai":
-        # OpenAI: Structure with tools first, then system, then user
-        # Auto-caches if prefix > 1024 tokens
-        return {
-            "model": "gpt-4-turbo",
-            "messages": [
-                {
-                    "role": "system",
-                    "content": f"Available tools:\n{json.dumps(tools, indent=2)}\n\n{system_instructions}"
-                },
-                {
-                    "role": "user",
-                    "content": f"{user_context}\n\nQuery: {query}"
-                }
-            ],
-            "tools": tools,  # Also pass tools in structured format
-        }
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
-
-# Usage
-tools = [
-    {
-        "name": "search_docs",
-        "description": "Search documentation",
-        "parameters": {"query": {"type": "string"}},
-    },
-    # ... 50 more tools (to reach 1024+ tokens)
-]
-
-system = "You are a helpful assistant. Use tools to answer queries."
-
-prompt = build_cacheable_prompt(
-    tools=tools,
-    system_instructions=system,
-    user_context="User: Alice, Tier: Premium",
-    query="How do I reset my password?",
-    provider="anthropic"
-)
-
-# Tools + system are cacheable (stable)
-# User context + query are volatile (change per request)
-
-
-# --- Section: Q5 - Cache Invalidation When Underlying Data Changes ---
-
-# Product catalog updated
-def on_product_update(product_id):
-    # Invalidate L1 exact matches
-    redis.delete(f"cache:product:{product_id}:*")
-
-    # Invalidate L2 semantic matches
-    query_embedding = embed(f"Tell me about product {product_id}")
-    similar_keys = vector_search(query_embedding, threshold=0.90)
-    for key in similar_keys:
-        redis.delete(key)
-
-    # L3 prefix cache: Can't invalidate hosted cache
-    # Option: Add product version to cacheable prefix
-    # "Product catalog version: {version}" in system prompt
-
-
-# --- Section: Q10 - XFetch Pattern for Stampede Prevention ---
-
-class XFetchCache:
-    def __init__(self):
-        self.cache = {}  # key -> (value, expiry)
-        self.in_flight = {}  # key -> asyncio.Future
-        self.lock = asyncio.Lock()
-
-    async def get_or_fetch(self, key, fetch_fn, ttl):
-        # Check cache
-        if key in self.cache and not expired(self.cache[key]):
-            return self.cache[key].value
-
-        # Check if another request is already fetching
-        async with self.lock:
-            if key in self.in_flight:
-                # Wait for in-flight request
-                return await self.in_flight[key]
-
-            # Become the leader
-            future = asyncio.create_task(self._fetch(key, fetch_fn, ttl))
-            self.in_flight[key] = future
-
-        try:
-            return await future
-        finally:
-            # Clean up
-            async with self.lock:
-                del self.in_flight[key]
-
-    async def _fetch(self, key, fetch_fn, ttl):
-        value = await fetch_fn()  # Call LLM
-        self.cache[key] = CacheEntry(value, time.time() + ttl)
-        return value
-
-
-# --- Section: Q12 - Cache Invalidation Strategy for Documentation Chatbot ---
-
-def build_prompt(query, docs_version):
     return {
-        "model": "claude-3-5-sonnet-20241022",
+        "model": parts.model,
+        "tools": parts.tools,
         "system": [
             {
                 "type": "text",
-                "text": f"""
-Documentation (version {docs_version}):
-{load_docs(docs_version)}
-
-You are a helpful assistant. Answer questions using the above docs.
-                """,
-                "cache_control": {"type": "ephemeral"}
+                "text": parts.system,
+                # Breakpoint: everything up to here is cached
+                "cache_control": {"type": "ephemeral"},
             }
         ],
-        "messages": [{"role": "user", "content": query}]
+        "messages": [
+            # Few-shots before the user message (also cacheable if stable)
+            *[
+                {"role": ex["role"], "content": ex["content"]}
+                for ex in parts.few_shots
+            ],
+            # User message is AFTER the breakpoint -- volatile, not cached
+            {"role": "user", "content": parts.user_message},
+        ],
     }
 
 
-# --- Section: Q12 - Version Increment on Docs Update ---
+def build_openai_prompt(parts: PromptParts) -> dict:
+    """Build an OpenAI GPT-5.6+ request with explicit breakpoints.
 
-# Increment version
-new_version = get_current_version() + 1
-set_current_version(new_version)
+    OpenAI implicit: breakpoint at end of latest eligible user/tool message.
+    Implicit mode caches the volatile latest message at 1.25x -- wasteful.
 
-# Old cache entries (version N) are now unused
-# They'll naturally evict via LRU or TTL expiration
+    mode=explicit (recommended): up to 4 breakpoints, you control what's cached.
+    Minimum: 1,024 tokens for GPT-5.6+.
 
-
-# --- Section: Q12 - Pre-Warm Cache After Docs Update ---
-
-# Monday 3 AM, after docs update
-top_queries = get_top_100_queries_from_last_week()
-for query in top_queries:
-    # This triggers L1, L2, L3 cache population
-    generate_response(query, docs_version=new_version)
-
-
-# --- Section: Scenario A - Multi-Tenant Agentic Platform (Tenant Isolation) ---
-
-def build_cache_key(tenant_id, prompt, model):
-    # Include tenant_id in key to prevent cross-tenant reads
-    canonical = json.dumps({
-        "tenant_id": tenant_id,
-        "prompt": prompt,
-        "model": model
-    }, sort_keys=True)
-
-    # HMAC with per-tenant salt
-    tenant_salt = get_tenant_salt(tenant_id)
-    return hmac.new(
-        tenant_salt.encode(),
-        canonical.encode(),
-        hashlib.sha256
-    ).hexdigest()
+    Routing: ~15 RPM per prefix/key before overflow.
+    Above ~15 RPM, shard prompt_cache_key across replicas.
+    """
+    return {
+        "model": parts.model,
+        "tools": parts.tools,
+        "messages": [
+            {
+                "role": "system",
+                "content": parts.system,
+            },
+            *[
+                {"role": ex["role"], "content": ex["content"]}
+                for ex in parts.few_shots
+            ],
+            {"role": "user", "content": parts.user_message},
+        ],
+        # Explicit breakpoints control what gets cached
+        "prompt_cache_options": {"mode": "explicit"},
+    }
 
 
-# --- Section: Scenario D - Real-Time News Summarizer (Time-Bucketed Cache) ---
+def prewarm_cache(parts: PromptParts) -> dict:
+    """Pre-warm a prompt cache before fan-out.
 
-def get_cache_key(topic, timestamp):
-    # Round timestamp to 5-min bucket
-    bucket = (timestamp // 300) * 300  # 300 seconds = 5 min
-    return f"cache:{topic}:{bucket}"
+    Anthropic: N identical prefixes on a cold cache = N writes at 1.25x
+    because the entry exists only AFTER the first response begins.
 
-def generate_summary(topic):
-    now = time.time()
-    key = get_cache_key(topic, now)
+    Serialize a max_tokens: 0 pre-warm, THEN fan out.
+    This is the stampede prevention pattern for hosted caches.
+    """
+    return {
+        "model": parts.model,
+        "system": [
+            {
+                "type": "text",
+                "text": parts.system,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+        "messages": [{"role": "user", "content": "warmup"}],
+        "max_tokens": 0,  # Pre-warm only, no generation
+    }
 
-    # Check cache
-    cached = redis.get(key)
-    if cached:
-        return cached
 
-    # Fetch latest articles (last 5 min)
-    articles = fetch_articles(topic, since=now - 300)
+# --- Semantic Cache with Embeddings ---
 
-    # Generate summary
-    summary = llm.generate(f"Summarize: {articles}")
+@dataclass
+class SemanticCacheEntry:
+    """A cached response keyed by embedding similarity."""
+    query: str
+    response: str
+    embedding: list[float]
+    tenant_id: str
+    model: str
+    created_at: float
+    ttl_s: float = 300.0  # 5 minutes default
 
-    # Cache for 5 minutes
-    redis.setex(key, 300, summary)
-    return summary
+
+class SemanticCache:
+    """Semantic cache: embed the query, HNSW kNN, threshold, return prior answer.
+
+    A HIT SKIPS THE LLM ENTIRELY -- both the win and the danger.
+
+    False positive risk: "return policy for electronics" matches
+    "return policy for clothing" at threshold 0.85.
+    Start cosine similarity 0.88 for FAQ, lower to 0.84 if paraphrases miss.
+
+    NEVER semantic-cache:
+    - Tool-using or agent loops (live state)
+    - Regulated traffic (financial, medical)
+    - Personalized requests ("what's my balance?")
+    - Creative generation
+    - Multi-turn conversations
+
+    InputSnatch: semantic caches leaked legal-domain prompts at 43-100% ASR.
+    """
+    def __init__(self, threshold: float = 0.90):
+        self.threshold = threshold
+        self.entries: list[SemanticCacheEntry] = []
+
+    def _embed(self, text: str) -> list[float]:
+        """Stub: embed text for similarity matching.
+
+        Production: use BGE-M3 (512-dim) for latency or
+        text-embedding-3-large (3072-dim) for quality.
+        """
+        h = hashlib.sha256(text.encode()).hexdigest()
+        return [int(h[i:i+2], 16) / 255.0 for i in range(0, 16, 2)]
+
+    def _cosine_sim(self, a: list[float], b: list[float]) -> float:
+        dot = sum(x * y for x, y in zip(a, b))
+        na = math.sqrt(sum(x * x for x in a))
+        nb = math.sqrt(sum(x * x for x in b))
+        return dot / (na * nb) if na > 0 and nb > 0 else 0.0
+
+    def get(self, query: str, tenant_id: str, model: str) -> Optional[str]:
+        """Look up a semantically similar cached response.
+
+        Must filter by tenant_id AND model -- missing tenant TAG = cross-talk.
+        In production: Redis FT.SEARCH with tenant/model/policy as TAG filters
+        in the SAME query as the kNN vector search.
+        """
+        q_emb = self._embed(query)
+        now = time.time()
+        best_match = None
+        best_sim = 0.0
+
+        for entry in self.entries:
+            # Tenant + model filter (mandatory -- omitting = cross-talk)
+            if entry.tenant_id != tenant_id or entry.model != model:
+                continue
+            # TTL check
+            if now - entry.created_at > entry.ttl_s:
+                continue
+
+            sim = self._cosine_sim(q_emb, entry.embedding)
+            if sim >= self.threshold and sim > best_sim:
+                best_sim = sim
+                best_match = entry
+
+        return best_match.response if best_match else None
+
+    def put(self, query: str, response: str, tenant_id: str, model: str,
+            ttl_s: float = 300.0):
+        """Store a response in the semantic cache.
+
+        Scan response for PII BEFORE caching -- a false-positive semantic hit
+        returns cached text verbatim. Never store raw PII in semantic answers.
+        """
+        emb = self._embed(query)
+        self.entries.append(SemanticCacheEntry(
+            query=query, response=response, embedding=emb,
+            tenant_id=tenant_id, model=model,
+            created_at=time.time(), ttl_s=ttl_s,
+        ))
+
+
+# --- KV Cache Memory Calculation ---
+
+def kv_cache_memory_per_token(
+    n_layers: int,
+    n_kv_heads: int,
+    d_head: int,
+    dtype_bytes: int = 2,  # BF16 = 2 bytes
+) -> dict:
+    """Calculate KV cache memory per token.
+
+    Formula per token per layer (BF16): 2 * n_kv_heads * d_head * 2 bytes
+    - Factor of 2 for K and V tensors
+    - GQA (Grouped Query Attention): 64 Q / 8 KV heads = 8x KV reduction vs MHA
+    - MLA (Multi-Head Latent Attention, DeepSeek-V2): 93.3% KV reduction vs MHA
+
+    Key numbers:
+    - Llama-3.1-405B (GQA):  ~516 KB/token
+    - Qwen-2.5-72B (GQA):   ~328 KB/token
+    - DeepSeek-V3 (MLA):    ~70 KB/token
+    - Llama-3.1-8B (GQA):   ~128 KB/token (32k context = ~4 GB of KV)
+    """
+    # Per token, per layer
+    bytes_per_token_per_layer = 2 * n_kv_heads * d_head * dtype_bytes
+    # Across all layers
+    bytes_per_token = bytes_per_token_per_layer * n_layers
+    kb_per_token = bytes_per_token / 1024
+
+    return {
+        "bytes_per_token_per_layer": bytes_per_token_per_layer,
+        "bytes_per_token": bytes_per_token,
+        "kb_per_token": round(kb_per_token, 3),
+        "mb_per_1k_tokens": round(kb_per_token * 1000 / 1024, 2),
+    }
+
+
+def kv_cache_for_prefix(
+    prefix_tokens: int,
+    kb_per_token: float,
+    num_tenants_sharing: int = 1,
+) -> dict:
+    """Calculate total KV cache memory for a shared prefix.
+
+    APC (Automatic Prefix Caching) shares prefix KV across requests
+    with the same salt. 32 same-salt tenants share 4.13 GB once, not x32.
+    But HMAC-per-tenant salt makes it x32 (security trade-off).
+
+    Worked example: 8k-token tools prefix on Llama-405B:
+    8000 x 516.096 KB = ~4.13 GB of KV for that prefix alone.
+    Same prefix on DeepSeek-V3 MLA: ~0.56 GB.
+    """
+    total_kb = prefix_tokens * kb_per_token
+    total_gb = total_kb / (1024 * 1024)
+
+    # With prefix sharing (APC/RadixAttention): stored once
+    shared_gb = total_gb
+    # Without sharing (per-tenant salt): stored N times
+    isolated_gb = total_gb * num_tenants_sharing
+
+    return {
+        "prefix_tokens": prefix_tokens,
+        "total_gb_shared": round(shared_gb, 3),
+        "total_gb_isolated": round(isolated_gb, 3),
+        "savings_with_sharing": f"{round((1 - 1/max(num_tenants_sharing, 1)) * 100, 1)}%",
+    }
+
+
+# Well-known model KV configurations for interview reference
+MODEL_KV_CONFIGS = {
+    "llama-3.1-8b": {"n_layers": 32, "n_kv_heads": 8, "d_head": 128, "label": "GQA 32L/8KV"},
+    "llama-3.1-70b": {"n_layers": 80, "n_kv_heads": 8, "d_head": 128, "label": "GQA 80L/8KV"},
+    "llama-3.1-405b": {"n_layers": 126, "n_kv_heads": 8, "d_head": 128, "label": "GQA 126L/8KV"},
+    "qwen-2.5-72b": {"n_layers": 80, "n_kv_heads": 8, "d_head": 128, "label": "GQA 80L/8KV"},
+    "deepseek-v3": {"n_layers": 61, "n_kv_heads": 1, "d_head": 288, "label": "MLA (93.3% KV reduction)"},
+}
+
+
+# --- Cache Warming Strategy ---
+
+@dataclass
+class CacheWarmingPlan:
+    """Plan for warming caches on deployment or failover.
+
+    Hosted cache is ephemeral: no dump API. Failover region = cold.
+    RTO = time to re-warm (one TTL window of write SKUs).
+
+    Regional processing: OpenAI caches cannot cross regional boundaries.
+    Anthropic/hosted KV have no dump API.
+    """
+    prefixes_to_warm: list[dict]    # List of {key, prompt_parts, priority}
+    warm_concurrency: int = 4       # Parallel warm requests
+    warm_timeout_s: float = 30.0    # Per-request timeout
+
+
+def create_warming_plan(
+    stable_prefixes: list[PromptParts],
+    priorities: Optional[list[int]] = None,
+) -> CacheWarmingPlan:
+    """Create a cache warming plan for deployment.
+
+    Order: warm highest-priority (highest-traffic) prefixes first.
+    Use max_tokens=0 for Anthropic to avoid generation cost.
+    Single-flight the warm requests to prevent stampede.
+    """
+    if priorities is None:
+        priorities = list(range(len(stable_prefixes)))
+
+    items = sorted(
+        zip(priorities, stable_prefixes),
+        key=lambda x: x[0],
+        reverse=True,  # Highest priority first
+    )
+
+    return CacheWarmingPlan(
+        prefixes_to_warm=[
+            {
+                "priority": p,
+                "key": hashlib.sha256(
+                    canonical_json({"model": parts.model, "system": parts.system}).encode()
+                ).hexdigest()[:16],
+                "model": parts.model,
+                "warm_request": prewarm_cache(parts),
+            }
+            for p, parts in items
+        ]
+    )
+
+
+# --- Cache Invalidation Patterns ---
+
+class CacheInvalidationStrategy:
+    """Cache invalidation patterns for LLM systems.
+
+    The five failure modes to know:
+    1. Prefix thrash: timestamp in cached span -> infinite 1.25x writes
+    2. Sub-floor silent no-op: prefix below minimum -> no error, just no caching
+    3. Stale tool/schema: 1h cached tools vs new runtime schema
+    4. Rolling-deploy cold: new pods empty, TTFT + write spike
+    5. Region failover "breaks" cache: hosted KV cannot cross regions
+    """
+
+    @staticmethod
+    def ttl_with_jitter(base_ttl_s: float, jitter_pct: float = 0.2) -> float:
+        """TTL with jitter to prevent stampede.
+
+        Spreads expiration across a window to prevent all entries
+        expiring at the same instant. Simple but effective.
+        """
+        jitter = base_ttl_s * jitter_pct
+        return base_ttl_s + random.uniform(-jitter, jitter)
+
+    @staticmethod
+    def version_key(tools_schema: dict, schema_version: str) -> str:
+        """Include schema version in cache key.
+
+        When tools/schema change, the cache key changes automatically.
+        Old cached entries expire naturally via TTL.
+        Prevents stale tool definitions from being served.
+        """
+        versioned = {**tools_schema, "_schema_version": schema_version}
+        return hashlib.sha256(canonical_json(versioned).encode()).hexdigest()[:32]
+
+    @staticmethod
+    def should_recompute_early(
+        compute_delta_s: float,
+        ttl_remaining_s: float,
+        beta: float = 1.0,
+    ) -> bool:
+        """XFetch probabilistic early recomputation.
+
+        Formula: recompute if -beta * delta * ln(random()) > ttl_remaining
+        As TTL remaining shrinks, probability of recomputation rises.
+        One request regenerates early; the rest continue hitting cache.
+
+        Prevents stampede without distributed locking.
+        """
+        if ttl_remaining_s <= 0:
+            return True
+        return -beta * compute_delta_s * math.log(random.random()) > ttl_remaining_s
+
+
+# --- Single-Flight for Cold Prefix Writes ---
+
+class SingleFlight:
+    """Serialize cold prefix writes so N cold requests are not N writes at 1.25x.
+
+    Anthropic: entry exists only after first response begins.
+    Without single-flight, N simultaneous cold requests = N writes.
+    With single-flight, 1 write + (N-1) wait for result.
+    """
+    def __init__(self):
+        self._locks: dict[str, threading.Lock] = {}
+        self._guard = threading.Lock()
+
+    def lock_for(self, key: str) -> threading.Lock:
+        with self._guard:
+            if key not in self._locks:
+                self._locks[key] = threading.Lock()
+            return self._locks[key]
+
+
+# --- Tenant Salt (Security) ---
+
+def compute_tenant_salt(server_secret: bytes, tenant_id: str) -> str:
+    """HMAC-based tenant salt for cache isolation.
+
+    Salt is a secret the GATEWAY injects. Never accept client-supplied salt.
+    vLLM: omit cache_salt = globally content-addressed sharing (timing attack).
+
+    CVE-2025-46570: ROC AUC 0.571 at 1-token, 0.99 at 8 tokens.
+    Patched >= vLLM 0.9.0 via salting.
+
+    Trade-off: per-tenant salt closes timing channel but duplicates KV
+    (32 tenants = 32x the KV memory vs shared).
+    """
+    digest = hmac.new(server_secret, tenant_id.encode(), hashlib.sha256).digest()
+    return hashlib.sha256(digest).hexdigest()
+
+
+# --- Cost Savings Calculator ---
+
+def cache_break_even(write_multiplier: float, read_multiplier: float) -> int:
+    """Calculate break-even reuse count.
+
+    n identical-prefix requests cost: W + (n-1)*R vs n uncached.
+    Break-even: n >= (W - R) / (1 - R)
+
+    Key numbers:
+    - Anthropic 5m / OpenAI 5.6: W=1.25, R=0.1 -> break-even n=2
+    - Anthropic 1h:              W=2.0,  R=0.1 -> break-even n=3
+    - Fable/Mythos 5.1:         W=1.25, R=0.025 -> break-even n=2
+    """
+    if read_multiplier >= 1.0:
+        return float("inf")  # Never breaks even
+    return math.ceil((write_multiplier - read_multiplier) / (1.0 - read_multiplier))
+
+
+def cache_cost_per_1k_queries(
+    prefix_tokens: int = 8000,
+    suffix_tokens: int = 400,
+    output_tokens: int = 400,
+    input_price_per_m: float = 2.00,     # Sonnet 5 base input
+    output_price_per_m: float = 10.00,   # Sonnet 5 output
+    write_multiplier: float = 1.25,       # 5m cache
+    read_multiplier: float = 0.10,        # 5m cache read
+    cache_hit_rate: float = 0.999,        # 1 write + 999 reads
+    queries: int = 1000,
+) -> dict:
+    """Calculate cost with and without prompt caching.
+
+    Reference mix: 8k-token tools+system prefix, 400-token user/tool suffix,
+    400-token output. 1,000 queries.
+
+    Sonnet 5, 5-minute cache:
+    - Uncached: $20.80/1k
+    - 1 write + 999 reads: ~$6.42/1k (69% savings)
+
+    gpt-5.6-luna:
+    - 1 write + 999 reads: ~$0.72/1k vs uncached $2.16
+    """
+    total_input = prefix_tokens + suffix_tokens
+
+    # Uncached cost
+    uncached_input_cost = queries * total_input * input_price_per_m / 1_000_000
+    uncached_output_cost = queries * output_tokens * output_price_per_m / 1_000_000
+    uncached_total = uncached_input_cost + uncached_output_cost
+
+    # Cached cost
+    writes = int(queries * (1 - cache_hit_rate)) or 1
+    reads = queries - writes
+
+    # Prefix cost: writes at write_multiplier, reads at read_multiplier
+    prefix_write_cost = writes * prefix_tokens * input_price_per_m * write_multiplier / 1_000_000
+    prefix_read_cost = reads * prefix_tokens * input_price_per_m * read_multiplier / 1_000_000
+
+    # Suffix is always uncached (after breakpoint)
+    suffix_cost = queries * suffix_tokens * input_price_per_m / 1_000_000
+
+    # Output cost is unchanged by caching
+    output_cost = uncached_output_cost
+
+    cached_total = prefix_write_cost + prefix_read_cost + suffix_cost + output_cost
+    savings_pct = (1 - cached_total / uncached_total) * 100 if uncached_total > 0 else 0
+
+    return {
+        "uncached_total": round(uncached_total, 2),
+        "cached_total": round(cached_total, 2),
+        "savings_usd": round(uncached_total - cached_total, 2),
+        "savings_pct": round(savings_pct, 1),
+        "breakdown": {
+            "prefix_write": round(prefix_write_cost, 3),
+            "prefix_read": round(prefix_read_cost, 3),
+            "suffix": round(suffix_cost, 3),
+            "output": round(output_cost, 3),
+        },
+        "writes": writes,
+        "reads": reads,
+    }
+
+
+def multi_tier_savings(
+    queries_per_month: int,
+    avg_input_tokens: int = 10000,
+    avg_output_tokens: int = 400,
+    input_price_per_m: float = 3.00,     # Sonnet 4.6
+    output_price_per_m: float = 15.00,
+    l1_exact_hit_rate: float = 0.20,     # FAQ exact repeats
+    l2_semantic_hit_rate: float = 0.25,  # Paraphrase variants
+    l3_prefix_hit_rate: float = 0.90,    # Prefix cache on remaining
+    l3_read_multiplier: float = 0.10,
+) -> dict:
+    """Multi-tier cache savings (L1 exact + L2 semantic + L3 prefix).
+
+    Scenario B from the module: 50K queries/day, $45K/mo current spend.
+    Target: 60% cost reduction.
+
+    L1 handles ~20% exact-repeat queries (password resets, balance checks).
+    L2 catches ~25% paraphrased variants (FAQ-style fee questions).
+    L3 reduces cost on remaining via shared system prompt + FAQ documents.
+    """
+    base_cost_per_query = (
+        avg_input_tokens * input_price_per_m / 1_000_000
+        + avg_output_tokens * output_price_per_m / 1_000_000
+    )
+    uncached_monthly = queries_per_month * base_cost_per_query
+
+    remaining = queries_per_month
+
+    # L1: Exact hit -- skip LLM entirely, cost ~0
+    l1_hits = int(remaining * l1_exact_hit_rate)
+    l1_cost = 0  # Redis lookup, negligible
+    remaining -= l1_hits
+
+    # L2: Semantic hit -- skip LLM entirely
+    l2_hits = int(remaining * l2_semantic_hit_rate)
+    l2_cost = l2_hits * avg_input_tokens * 0.02 / 1_000_000  # Embedding cost only
+    remaining -= l2_hits
+
+    # L3: Prefix cache on rest
+    l3_prefix_tokens = int(avg_input_tokens * 0.8)  # 80% is stable prefix
+    l3_suffix_tokens = avg_input_tokens - l3_prefix_tokens
+    l3_cached = int(remaining * l3_prefix_hit_rate)
+    l3_miss = remaining - l3_cached
+
+    l3_cached_cost = l3_cached * (
+        l3_prefix_tokens * input_price_per_m * l3_read_multiplier / 1_000_000
+        + l3_suffix_tokens * input_price_per_m / 1_000_000
+        + avg_output_tokens * output_price_per_m / 1_000_000
+    )
+    l3_miss_cost = l3_miss * base_cost_per_query
+
+    cached_monthly = l1_cost + l2_cost + l3_cached_cost + l3_miss_cost
+    savings_pct = (1 - cached_monthly / uncached_monthly) * 100 if uncached_monthly > 0 else 0
+
+    return {
+        "uncached_monthly": round(uncached_monthly, 2),
+        "cached_monthly": round(cached_monthly, 2),
+        "savings_usd": round(uncached_monthly - cached_monthly, 2),
+        "savings_pct": round(savings_pct, 1),
+        "tier_breakdown": {
+            "l1_exact_hits": l1_hits,
+            "l2_semantic_hits": l2_hits,
+            "l3_prefix_cached": l3_cached,
+            "l3_miss": l3_miss,
+        },
+    }
+
+
+# --- Cache Hit Rate Monitoring ---
+
+@dataclass
+class CacheMetrics:
+    """Metrics to monitor -- dashboards that lie are a common failure mode.
+
+    A 99% TOKEN hit rate with 100% write rate means you are paying 1.25x
+    on every request (prefix thrash).
+
+    Board ALL of these, not just token hit rate:
+    - Token hit rate (cached_tokens / total_input_tokens)
+    - Request hit rate (requests with cache hit / total requests)
+    - Write/read ratio (cache_write_tokens / cache_read_tokens)
+    - RPM per prompt_cache_key (alert at ~15 before overflow)
+    """
+    total_requests: int = 0
+    cache_hits: int = 0
+    total_input_tokens: int = 0
+    cached_tokens: int = 0
+    cache_write_tokens: int = 0
+
+    def record(self, input_tokens: int, cached: int, written: int):
+        self.total_requests += 1
+        self.total_input_tokens += input_tokens
+        self.cached_tokens += cached
+        self.cache_write_tokens += written
+        if cached > 0:
+            self.cache_hits += 1
+
+    @property
+    def token_hit_rate(self) -> float:
+        return self.cached_tokens / max(self.total_input_tokens, 1)
+
+    @property
+    def request_hit_rate(self) -> float:
+        return self.cache_hits / max(self.total_requests, 1)
+
+    @property
+    def write_read_ratio(self) -> float:
+        return self.cache_write_tokens / max(self.cached_tokens, 1)
+
+    def diagnose(self) -> list[str]:
+        """Diagnose common caching issues from metrics."""
+        issues = []
+        if self.token_hit_rate > 0.95 and self.write_read_ratio > 0.5:
+            issues.append(
+                "High token hit rate but high write ratio -- likely prefix thrash. "
+                "Check for timestamps or unsorted JSON in the cached span."
+            )
+        if self.token_hit_rate > 0.90 and self.request_hit_rate < 0.10:
+            issues.append(
+                "High token hit but low request hit -- large static prefix "
+                "with unique queries. Token hit is misleading; check actual savings."
+            )
+        if self.token_hit_rate < 0.10:
+            issues.append(
+                "Very low token hit rate -- verify prompt assembly. "
+                "Check: prefix below model minimum? Volatile content in cached span?"
+            )
+        return issues
+
+
+# --- Demo ---
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("Caching in LLM Systems -- Interview Prep Demos")
+    print("=" * 60)
+
+    # 1. Prompt caching patterns
+    print("\n--- Prompt Caching (Anthropic) ---")
+    parts = PromptParts(
+        model="claude-sonnet-5-20260901",
+        tools=[{"name": "search", "description": "Search the knowledge base"}],
+        system="You are a helpful customer support agent. Use the search tool to find answers.",
+        user_message="What is your return policy?",
+    )
+    anthropic_req = build_anthropic_prompt(parts)
+    print(f"System has cache_control: {anthropic_req['system'][0].get('cache_control')}")
+    print(f"User message (volatile, after breakpoint): '{parts.user_message}'")
+
+    # 2. KV cache memory calculations
+    print("\n--- KV Cache Memory Math ---")
+    for model_name, cfg in MODEL_KV_CONFIGS.items():
+        mem = kv_cache_memory_per_token(
+            n_layers=cfg["n_layers"],
+            n_kv_heads=cfg["n_kv_heads"],
+            d_head=cfg["d_head"],
+        )
+        print(f"  {model_name:20s} ({cfg['label']:25s}): {mem['kb_per_token']:>10.3f} KB/token")
+
+    # Worked example: 8k prefix on Llama-405B
+    print("\n  Worked example: 8k-token tools prefix")
+    llama405b = kv_cache_memory_per_token(126, 8, 128)
+    ds_v3 = kv_cache_memory_per_token(61, 1, 288)
+    prefix_llama = kv_cache_for_prefix(8000, llama405b["kb_per_token"], num_tenants_sharing=32)
+    prefix_ds = kv_cache_for_prefix(8000, ds_v3["kb_per_token"], num_tenants_sharing=32)
+    print(f"  Llama-405B: {prefix_llama['total_gb_shared']:.2f} GB shared, "
+          f"{prefix_llama['total_gb_isolated']:.2f} GB isolated (32 tenants)")
+    print(f"  DeepSeek-V3: {prefix_ds['total_gb_shared']:.2f} GB shared, "
+          f"{prefix_ds['total_gb_isolated']:.2f} GB isolated (32 tenants)")
+
+    # 3. Semantic cache
+    print("\n--- Semantic Cache ---")
+    cache = SemanticCache(threshold=0.90)
+    cache.put("What is your return policy?", "Returns accepted within 30 days.",
+              tenant_id="acme", model="sonnet-5")
+
+    hit = cache.get("What is the return policy?", tenant_id="acme", model="sonnet-5")
+    cross_tenant = cache.get("What is the return policy?", tenant_id="other", model="sonnet-5")
+    print(f"Same-tenant hit:  {hit}")
+    print(f"Cross-tenant hit: {cross_tenant}  (correctly blocked by tenant filter)")
+
+    # 4. Cache warming
+    print("\n--- Cache Warming Plan ---")
+    prefixes = [
+        PromptParts("sonnet-5", [], "System prompt A", user_message=""),
+        PromptParts("sonnet-5", [], "System prompt B", user_message=""),
+    ]
+    plan = create_warming_plan(prefixes, priorities=[10, 5])
+    for item in plan.prefixes_to_warm:
+        print(f"  Priority {item['priority']}: key={item['key']}, "
+              f"max_tokens={item['warm_request']['max_tokens']}")
+
+    # 5. Break-even analysis
+    print("\n--- Break-Even Reuse Count ---")
+    schemes = [
+        ("Anthropic 5m / OpenAI 5.6", 1.25, 0.10),
+        ("Anthropic 1h", 2.00, 0.10),
+        ("Fable/Mythos 5.1", 1.25, 0.025),
+        ("Fireworks default", 1.00, 0.50),
+    ]
+    for name, w, r in schemes:
+        n = cache_break_even(w, r)
+        print(f"  {name:30s}: break-even at n={n} requests")
+
+    # 6. Cost savings
+    print("\n--- Cost per 1k Queries (Sonnet 5, 5m cache) ---")
+    sonnet_cost = cache_cost_per_1k_queries(
+        input_price_per_m=2.00, output_price_per_m=10.00
+    )
+    print(f"  Uncached: ${sonnet_cost['uncached_total']:.2f}")
+    print(f"  Cached:   ${sonnet_cost['cached_total']:.2f}")
+    print(f"  Savings:  {sonnet_cost['savings_pct']}% (${sonnet_cost['savings_usd']:.2f})")
+
+    luna_cost = cache_cost_per_1k_queries(
+        input_price_per_m=0.20, output_price_per_m=1.20
+    )
+    print(f"\n  Luna uncached: ${luna_cost['uncached_total']:.2f}")
+    print(f"  Luna cached:   ${luna_cost['cached_total']:.2f}")
+
+    # 7. Multi-tier savings (50K/day support bot scenario)
+    print("\n--- Multi-Tier Savings (50K queries/day) ---")
+    tier_savings = multi_tier_savings(queries_per_month=50000 * 30)
+    print(f"  Uncached monthly: ${tier_savings['uncached_monthly']:,.0f}")
+    print(f"  Cached monthly:   ${tier_savings['cached_monthly']:,.0f}")
+    print(f"  Savings:          {tier_savings['savings_pct']}% "
+          f"(${tier_savings['savings_usd']:,.0f}/mo)")
+
+    # 8. Invalidation patterns
+    print("\n--- Invalidation Patterns ---")
+    inv = CacheInvalidationStrategy()
+    ttls = [inv.ttl_with_jitter(300.0) for _ in range(5)]
+    print(f"  TTL with jitter (base=300s): {[round(t, 1) for t in ttls]}")
+
+    key_v1 = inv.version_key({"search": {}}, "v1")
+    key_v2 = inv.version_key({"search": {}}, "v2")
+    print(f"  Schema v1 key: {key_v1[:16]}...")
+    print(f"  Schema v2 key: {key_v2[:16]}... (different -> cache auto-invalidates)")
+
+    # 9. Cache metrics diagnosis
+    print("\n--- Cache Metrics Diagnosis ---")
+    metrics = CacheMetrics()
+    # Simulate prefix thrash: high token hit, high writes
+    for _ in range(100):
+        metrics.record(input_tokens=10000, cached=9500, written=9500)
+    print(f"  Token hit rate: {metrics.token_hit_rate:.1%}")
+    print(f"  Write/read ratio: {metrics.write_read_ratio:.2f}")
+    issues = metrics.diagnose()
+    for issue in issues:
+        print(f"  Issue: {issue[:100]}...")
+
+    # 10. Tenant salt
+    print("\n--- Tenant Salt (Security) ---")
+    secret = b"server-secret-key-never-from-client"
+    salt_a = compute_tenant_salt(secret, "tenant_a")
+    salt_b = compute_tenant_salt(secret, "tenant_b")
+    print(f"  Tenant A salt: {salt_a[:16]}...")
+    print(f"  Tenant B salt: {salt_b[:16]}... (different -> no shared KV)")

@@ -1,3222 +1,1598 @@
-# LLM & Agent Evaluation
+# Module 04: LLM and Agent Evaluation
 
 ## What Is This?
 
-LLM and agent evaluation is the systematic measurement of model and agent behavior against known-good outcomes. Think of it as a manufacturing QC test lab, not a report card. Every release decision, every production change, every prompt iteration gates on eval results.
+Imagine you hire a new employee. You would not just trust them blindly -- you would review their work, test them on known problems, and have a senior colleague grade their answers before they go live with customers. LLM evaluation is exactly that, but for AI systems: you feed the system known inputs, score its outputs against criteria (using rules, another LLM as "judge," or humans), and decide whether it is good enough to ship. The twist is that unlike testing traditional software where 2 + 2 must equal 4, LLM outputs are probabilistic and open-ended, so the field has developed specialized paradigms -- pointwise scoring, pairwise comparison, reference-based checking -- and layered them into CI/CD pipelines that gate deployments on quality thresholds. Agent evaluation adds another dimension: you are no longer scoring a single response but an entire multi-step workflow -- did the agent pick the right tools, call them correctly, recover from errors, and ultimately achieve the user's goal?
 
-**Mental model: Dual-Oracle System**
-- Hard Oracle: Ground truth (exact answers, verified tool calls, gold-standard trajectories)
-- Soft Oracle: LLM-as-judge scoring quality on dimensions that have no single correct answer (helpfulness, tone, relevance)
-
-**The evaluated system is:**
-```
-model × scaffold × tools × environment × judge × sampling
-```
-
-Change any one component and the score changes. An eval measures the entire stack, not just the model.
-
-**Three independently scaled planes:**
-```
-                  ┌─────────────────────┐
-                  │   Eval Harness      │ ← Pre-production quality gate
-                  │   (SWE-bench, GAIA) │
-                  └─────────────────────┘
-                           │
-                           │ Release decision
-                           ▼
-                  ┌─────────────────────┐
-                  │  Production Agent   │
-                  │  (model+scaffold)   │
-                  └─────────────────────┘
-                           │
-                           │ traces, samples (1-10%)
-                           ▼
-                  ┌─────────────────────┐
-                  │  Online Eval        │ ← Drift detection, regression
-                  │  (Judge Sidecar)    │
-                  └─────────────────────┘
-```
-
-Each plane runs at a different cadence:
-- Eval harness: Every model change, daily CI
-- Production: Continuous deployment
-- Online eval: Sliding window, hourly or per-batch
-
-**Core analogy:** "Hiring a new employee"
-- Resume screening = Benchmark pass rate (SWE-bench, GAIA)
-- Technical interview = Trajectory evaluation (tool usage, reasoning quality)
-- 90-day probation = Online eval in production (regression detection)
-
-## Why It Matters
-
-**Without evals, you have:**
-- No release gate (can't ship confidently)
-- No regression detection (silent degradation)
-- No A/B test validity (don't know which variant is better)
-- No optimization signal (prompt engineering is guesswork)
-
-**With evals, you get:**
-- Automated quality gate: Block releases that drop task success below threshold
-- Cost/quality Pareto frontier: Choose the cheapest model that meets SLA
-- Contamination defense: Detect when the model has memorized the test set
-- Accountability: Trace every production failure back to an eval gap
-
-**Real impact:**
-- Anthropic tau-airline study: Extended thinking improved pass^1 from 33.2% to 58.4%
-- HumanEval+: Scaling test suite 80x dropped GPT-4 pass@1 by 19.3 percentage points
-- On Randomness study: Temperature 0 still produces >1.5pp standard deviation across 60,000 agent trajectories
-- AgentLens: 10.7% of "passing" agent runs were lucky false positives
-
-## Architecture / System Design
-
-### High-Level Flow
-
-```
-┌──────────────┐
-│   Dataset    │  Test cases (inputs + expected outputs)
-└──────┬───────┘
-       │
-       ▼
-┌──────────────┐
-│ Eval Runner  │  Orchestrates execution, batching, retries
-└──────┬───────┘
-       │
-       ▼
-┌──────────────┐
-│ Target Agent │  Model + scaffold + tools
-└──────┬───────┘
-       │
-       ▼
-┌──────────────┐
-│ Environment  │  Sandboxed execution (filesystem, APIs, databases)
-│   + Tools    │
-└──────┬───────┘
-       │
-       ▼
-┌──────────────┐
-│   Traces     │  Logs of all actions, tool calls, LLM responses
-└──────┬───────┘
-       │
-       ▼
-┌──────────────┐
-│   Graders    │  Hard oracle (exact match) + Soft oracle (LLM judge)
-└──────┬───────┘
-       │
-       ▼
-┌──────────────┐
-│  Statistics  │  Aggregate metrics (pass@k, cost, latency)
-└──────┬───────┘
-       │
-       ▼
-┌──────────────┐
-│ Release Gate │  Go/No-Go decision (threshold check)
-└──────────────┘
-```
-
-### Three-Layer Eval Stack
-
-**Layer 1: End-to-End (Task Success)**
-- Binary: Did the agent accomplish the goal?
-- Examples: Solved the GitHub issue (SWE-bench), answered the question correctly (GAIA), booked the correct flight (tau-airline)
-- Metric: pass@k, pass^k
-
-**Layer 2: Trajectory Quality**
-- How did the agent get to the answer?
-- Tool selection accuracy, argument correctness, reasoning coherence
-- Scored per step, aggregated over trajectory
-- Metric: Geometric mean of step scores
-
-**Layer 3: Component-Level**
-- Individual scaffold pieces in isolation
-- Tool selection: Accuracy of choosing the right tool given a state
-- Argument generation: Correctness of parameters passed to tools
-- Error recovery: Does the agent retry after tool failure?
-- Metric: Per-component accuracy
-
-### Evaluation Paradigms
-
-| Paradigm | Input | Output | Use Case | Example |
-|----------|-------|--------|----------|---------|
-| **Pointwise** | Single response | Absolute score | Pass/fail, quality rating | "Is this summary factually correct?" |
-| **Pairwise** | Two responses | Preference (A>B, B>A, Tie) | A/B tests, model comparison | "Which answer is more helpful?" |
-| **Reference-Based** | Response + Gold standard | Similarity/correctness | Exact task success | "Does the SQL query match the expected result?" |
-
-**When to use each:**
-- Pointwise: Production monitoring, absolute quality gate
-- Pairwise: Choosing between prompt variants, model selection
-- Reference-based: Benchmarks with ground truth (SWE-bench, MATH)
-
-### Six Dimensions of Agent Evaluation
-
-```
-1. Task Success (binary or continuous)
-   └─ pass@k, pass^k, exact match, F1
-
-2. Trajectory Quality
-   ├─ Tool selection accuracy (>=95% target)
-   ├─ Argument correctness (>=90% target)
-   ├─ Repetition rate (<5% target)
-   └─ Error recovery
-
-3. Tool Accuracy
-   ├─ Precision: Did the agent call only necessary tools?
-   ├─ Recall: Did it call all required tools?
-   └─ Efficiency: Minimum tool calls to solve the task
-
-4. Output Quality (LLM-as-judge)
-   ├─ Relevance
-   ├─ Helpfulness
-   ├─ Harmlessness
-   ├─ Factuality
-   └─ Style/Tone
-
-5. Cost
-   ├─ Input tokens
-   ├─ Output tokens
-   ├─ Cached tokens (if applicable)
-   ├─ Tool call overhead
-   └─ Judge tokens (for eval itself)
-
-6. Latency
-   ├─ Time to first token (TTFT)
-   ├─ Time to completion
-   ├─ p50, p95, p99 distribution
-   └─ Tool execution time
-```
-
-**Hierarchy:** Task success is the north star. Trajectory quality explains why success happened or failed. Cost and latency are constraints (meet SLA while maximizing success).
-
-## Core Concepts & Algorithms
-
-### pass@k (Unbiased Estimator)
-
-**Definition:** Probability that at least one of k samples solves the task.
-
-**Why it matters:** A model that solves a task 30% of the time is useless if you can only afford one try. But if you can sample k=3 times and pick the best, success rate jumps to 65.7%.
-
-**Formula (Chen et al., Codex paper):**
-```
-pass@k = 1 - C(n - c, k) / C(n, k)
-
-where:
-  n = total samples drawn per task
-  c = number of correct samples
-  k = samples you want to estimate for (k <= n)
-  C(a, b) = binomial coefficient "a choose b"
-```
-
-**Numerically stable form (product of fractions):**
-```
-pass@k = 1 - ∏(i=0 to k-1) [(n - c - i) / (n - i)]
-```
-
-**Intuition:** You draw n samples, observe c successes. pass@k estimates the probability of at least one success if you had drawn k samples instead.
-
-**Example:**
-```
-n = 10 samples drawn
-c = 3 correct
-k = 5 (estimate for 5 samples)
-
-pass@5 = 1 - C(10-3, 5) / C(10, 5)
-       = 1 - C(7, 5) / C(10, 5)
-       = 1 - 21 / 252
-       = 1 - 0.0833
-       = 0.9167 (91.67%)
-```
-
-**HumanEval+ result:** When tests were scaled 80x, pass@k dropped:
-- GPT-4: 19.3 percentage points
-- GPT-3.5: 24.9 percentage points
-- CodeGen: 28.9 percentage points
-
-This shows contamination or overfitting to shallow test coverage.
-
-### pass^k (Reliability Metric)
-
-**Definition:** Probability that all k samples solve the task (dual to pass@k).
-
-**Formula (Yao et al., tau-bench):**
-```
-pass^k = C(c, k) / C(n, k)
-
-where c >= k (must have at least k correct samples)
-```
-
-**Intuition:** Draw without replacement. If you need k consecutive successes, what's the probability?
-
-**Use case:** Reliability-critical applications where every invocation must succeed (medical diagnosis, financial advice).
-
-**Example:**
-```
-n = 10 samples
-c = 8 correct
-k = 3
-
-pass^3 = C(8, 3) / C(10, 3)
-       = 56 / 120
-       = 0.4667 (46.67%)
-```
-
-**Anthropic tau-airline study (with extended thinking):**
-
-| Metric | Baseline | With Think Tool |
-|--------|----------|-----------------|
-| pass^1 | 0.332 | 0.584 (+25.2 pp) |
-| pass^2 | 0.197 | 0.465 (+26.8 pp) |
-| pass^3 | 0.127 | 0.381 (+25.4 pp) |
-| pass^4 | 0.084 | 0.320 (+23.6 pp) |
-| pass^5 | 0.100 | 0.340 (+24.0 pp) |
-
-**Retail task (extended thinking):**
-- pass^1: 0.812
-- pass^5: 0.626 (drops 18.6 pp due to variance)
-
-**Key insight:** pass^k always <= pass@k. Gap shows variance. Narrow gap = consistent agent.
-
-### On Randomness in Agent Evaluation
-
-**Study (2026):** 60,000 trajectories, 25.58B tokens, 1.88M tool calls across multiple benchmarks.
-
-**Finding:** Even at temperature = 0, standard deviation >1.5 percentage points across runs of the same task.
-
-**Sources of variance:**
-1. Non-deterministic tool execution (API latency, database state)
-2. Tie-breaking in greedy sampling (multiple tokens with same logprob)
-3. Infrastructure noise (batching, quantization, GPU placement)
-4. Retry logic (agent retries after failure, order of retries varies)
-
-**Implication:** A single run is not enough. Always sample n>=10 per task to estimate pass@k reliably.
-
-**Retry inflation:** If an agent retries failed tasks, pass@1 overstates single-shot performance. Report both "pass@1 (no retry)" and "pass@1 (with retry)" separately.
-
-### Power Analysis for Eval Sample Size
-
-**Question:** How many samples do you need to detect a 3 percentage point drop in pass@1 with 95% confidence?
-
-**Formula (two-proportion z-test, Miller et al.):**
-```
-n ≈ 2 * (z_alpha + z_beta)^2 * p * (1 - p) / delta^2
-
-where:
-  z_alpha = 1.96 (for 95% confidence)
-  z_beta = 0.84 (for 80% power)
-  p = baseline pass rate (e.g., 0.5)
-  delta = minimum detectable difference (e.g., 0.03)
-
-Example:
-  p = 0.5, delta = 0.03
-  n ≈ 2 * (1.96 + 0.84)^2 * 0.5 * 0.5 / 0.03^2
-  n ≈ 2 * 7.84 * 0.25 / 0.0009
-  n ≈ 969 samples per variant
-```
-
-**Rule of thumb:** 1000+ samples to detect 3pp differences, 250+ for 6pp, 100+ for 12pp.
-
-### Trajectory Scoring
-
-**Problem:** How do you aggregate per-step scores into a single trajectory score?
-
-**Options:**
-
-**1. Arithmetic Mean**
-```
-score = (s1 + s2 + ... + sn) / n
-```
-Problem: One bad step gets averaged out.
-
-**2. Geometric Mean (Recommended)**
-```
-score = (s1 * s2 * ... * sn)^(1/n)
-```
-Benefit: Any step score of 0 makes the entire trajectory 0. Captures compounding quality.
-
-**Worked example:**
-```
-5-step trajectory:
-  Step 1: Tool selection correct (1.0)
-  Step 2: Argument error (0.5)
-  Step 3: Tool selection correct (1.0)
-  Step 4: Tool selection correct (1.0)
-  Step 5: Final answer correct (1.0)
-
-Arithmetic mean: (1.0 + 0.5 + 1.0 + 1.0 + 1.0) / 5 = 0.90
-Geometric mean: (1.0 * 0.5 * 1.0 * 1.0 * 1.0)^(1/5) = 0.87
-
-Geometric mean penalizes the error more, which is correct: the trajectory had a flaw.
-```
-
-**3. Minimum (Strictest)**
-```
-score = min(s1, s2, ..., sn)
-```
-Use for safety-critical systems where one mistake is fatal.
-
-**4. Weighted Average**
-```
-score = w1*s1 + w2*s2 + ... + wn*sn
-```
-Use when later steps matter more (e.g., final answer is 50% of score, reasoning is 50%).
-
-### Trajectory Evaluation Modes
-
-| Mode | Description | Example | Use Case |
-|------|-------------|---------|----------|
-| **Exact Matching** | Tool calls must match gold trajectory exactly (order + args) | SWE-bench: Expected `git diff`, agent called `git status` first → fail | High-fidelity reproduction tasks |
-| **Set-Based** | Tool calls must match as a set (order doesn't matter) | Required: {search, read, edit}. Agent: {read, search, edit} → pass | Tasks with no canonical order |
-| **Partial Credit** | Score proportional to overlap with gold trajectory | 3/5 steps correct → 60% | Debugging, explainability |
-| **LLM Judge** | Judge scores trajectory quality on rubric | "Rate reasoning coherence 1-5" | Open-ended tasks |
-
-### Component-Level Sub-Metrics
-
-**Tool Selection Accuracy:**
-```
-Accuracy = (Correct tool calls) / (Total tool calls)
-Target: >= 95%
-```
-
-**Argument Correctness:**
-```
-Correctness = (Correct args) / (Total args)
-Target: >= 90%
-```
-
-**Repetition Rate:**
-```
-Repetition = (Duplicate tool calls) / (Total tool calls)
-Target: < 5%
-```
-
-**Error Recovery:**
-```
-Recovery = (Retries that succeed) / (Total errors)
-Target: >= 70%
-```
-
-## Code Examples
-
-### Production-Grade Eval Pipeline (Layered Scoring)
-
-```python
-from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
-import numpy as np
-from enum import Enum
-
-class TrajectoryStep:
-    """Single step in agent execution"""
-    def __init__(self, tool: str, args: Dict[str, Any], output: Any, 
-                 duration_ms: int, error: Optional[str] = None):
-        self.tool = tool
-        self.args = args
-        self.output = output
-        self.duration_ms = duration_ms
-        self.error = error
-
-class ScoreMode(Enum):
-    GEOMETRIC_MEAN = "geometric"
-    ARITHMETIC_MEAN = "arithmetic"
-    MINIMUM = "minimum"
-    WEIGHTED = "weighted"
-
-@dataclass
-class EvalResult:
-    task_id: str
-    task_success: bool
-    trajectory_score: float
-    cost_usd: float
-    latency_ms: int
-    steps: List[TrajectoryStep]
-    judge_feedback: Optional[str] = None
-
-class EvalPipeline:
-    """
-    Multi-layer eval pipeline with hard + soft oracle.
-    
-    Layers:
-      1. Task success (binary)
-      2. Trajectory quality (geometric mean of step scores)
-      3. Component-level (tool selection, args, recovery)
-    """
-    
-    def __init__(self, judge_model: str = "claude-opus-5", 
-                 score_mode: ScoreMode = ScoreMode.GEOMETRIC_MEAN):
-        self.judge_model = judge_model
-        self.score_mode = score_mode
-        self.circuit_breaker = CircuitBreaker(
-            failure_threshold=5,
-            timeout_seconds=30,
-            half_open_after=60
-        )
-    
-    def evaluate_task(self, task_id: str, agent_output: Any, 
-                     expected_output: Any, trajectory: List[TrajectoryStep],
-                     cost_usd: float, latency_ms: int) -> EvalResult:
-        """
-        Evaluate a single task across all layers.
-        """
-        # Layer 1: Task success (hard oracle)
-        task_success = self._check_task_success(agent_output, expected_output)
-        
-        # Layer 2: Trajectory quality
-        step_scores = [self._score_step(step) for step in trajectory]
-        trajectory_score = self._aggregate_scores(step_scores)
-        
-        # Layer 3: LLM judge (soft oracle) - only if needed
-        judge_feedback = None
-        if not task_success and trajectory_score > 0.7:
-            # High trajectory quality but wrong answer - get judge insight
-            judge_feedback = self._invoke_judge(trajectory, agent_output, expected_output)
-        
-        return EvalResult(
-            task_id=task_id,
-            task_success=task_success,
-            trajectory_score=trajectory_score,
-            cost_usd=cost_usd,
-            latency_ms=latency_ms,
-            steps=trajectory,
-            judge_feedback=judge_feedback
-        )
-    
-    def _check_task_success(self, agent_output: Any, expected: Any) -> bool:
-        """Hard oracle: exact match or semantic equivalence"""
-        if isinstance(expected, str) and isinstance(agent_output, str):
-            # Normalize whitespace, case
-            return agent_output.strip().lower() == expected.strip().lower()
-        return agent_output == expected
-    
-    def _score_step(self, step: TrajectoryStep) -> float:
-        """
-        Score individual step on [0, 1].
-        
-        Criteria:
-          - Tool selection: 0.4
-          - Argument correctness: 0.4
-          - No error: 0.2
-        """
-        score = 0.0
-        
-        # Tool selection (mock - in practice, check against expected)
-        if step.tool in ["search", "read", "write", "execute"]:
-            score += 0.4
-        
-        # Argument correctness (mock - in practice, validate schema)
-        if step.args and all(v is not None for v in step.args.values()):
-            score += 0.4
-        
-        # No error
-        if step.error is None:
-            score += 0.2
-        
-        return min(score, 1.0)
-    
-    def _aggregate_scores(self, scores: List[float]) -> float:
-        """Aggregate step scores into trajectory score"""
-        if not scores:
-            return 0.0
-        
-        if self.score_mode == ScoreMode.GEOMETRIC_MEAN:
-            # Geometric mean: (s1 * s2 * ... * sn)^(1/n)
-            product = np.prod(scores)
-            return product ** (1.0 / len(scores))
-        
-        elif self.score_mode == ScoreMode.ARITHMETIC_MEAN:
-            return np.mean(scores)
-        
-        elif self.score_mode == ScoreMode.MINIMUM:
-            return min(scores)
-        
-        elif self.score_mode == ScoreMode.WEIGHTED:
-            # Last step (final answer) gets 50% weight, rest split equally
-            weights = [1.0] * len(scores)
-            weights[-1] = len(scores)  # 50% to last step
-            return np.average(scores, weights=weights)
-        
-        return 0.0
-    
-    def _invoke_judge(self, trajectory: List[TrajectoryStep], 
-                     agent_output: Any, expected: Any) -> str:
-        """
-        LLM-as-judge for qualitative feedback.
-        
-        Uses circuit breaker to prevent cascading failures.
-        """
-        if not self.circuit_breaker.allow_request():
-            return "Judge unavailable (circuit breaker open)"
-        
-        try:
-            prompt = self._build_judge_prompt(trajectory, agent_output, expected)
-            # Mock API call - in practice, call Claude API
-            response = self._call_judge_api(prompt)
-            self.circuit_breaker.record_success()
-            return response
-        except Exception as e:
-            self.circuit_breaker.record_failure()
-            return f"Judge error: {str(e)}"
-    
-    def _build_judge_prompt(self, trajectory: List[TrajectoryStep], 
-                           agent_output: Any, expected: Any) -> str:
-        """Build prompt for LLM judge"""
-        trajectory_str = "\n".join([
-            f"Step {i+1}: {step.tool}({step.args}) -> {step.output}"
-            for i, step in enumerate(trajectory)
-        ])
-        
-        return f"""Evaluate this agent trajectory.
-
-Expected output: {expected}
-Agent output: {agent_output}
-
-Trajectory:
-{trajectory_str}
-
-Score on:
-1. Tool selection accuracy (were the right tools chosen?)
-2. Reasoning coherence (did steps follow logically?)
-3. Error handling (were failures recovered gracefully?)
-
-Provide a 1-paragraph assessment and a score 1-5."""
-    
-    def _call_judge_api(self, prompt: str) -> str:
-        """Mock judge API call"""
-        # In production: client.messages.create(model=self.judge_model, ...)
-        return "Mock judge feedback: trajectory quality is high but final answer is off by one."
-
-
-class CircuitBreaker:
-    """
-    Circuit breaker for LLM judge calls.
-    
-    States:
-      CLOSED: Normal operation
-      OPEN: Too many failures, reject all requests
-      HALF_OPEN: Test if service recovered
-    """
-    
-    def __init__(self, failure_threshold: int, timeout_seconds: int, 
-                 half_open_after: int):
-        self.failure_threshold = failure_threshold
-        self.timeout_seconds = timeout_seconds
-        self.half_open_after = half_open_after
-        self.failure_count = 0
-        self.last_failure_time = 0
-        self.state = "CLOSED"
-    
-    def allow_request(self) -> bool:
-        """Check if request should be allowed"""
-        import time
-        now = time.time()
-        
-        if self.state == "OPEN":
-            if now - self.last_failure_time > self.half_open_after:
-                self.state = "HALF_OPEN"
-                return True
-            return False
-        
-        return True
-    
-    def record_success(self):
-        """Reset failure count on success"""
-        self.failure_count = 0
-        self.state = "CLOSED"
-    
-    def record_failure(self):
-        """Increment failure count, open circuit if threshold exceeded"""
-        import time
-        self.failure_count += 1
-        self.last_failure_time = time.time()
-        
-        if self.failure_count >= self.failure_threshold:
-            self.state = "OPEN"
-
-
-class LLMJudge:
-    """
-    LLM-as-judge with retry logic and fallback.
-    
-    Features:
-      - Exponential backoff retry
-      - Fallback to cheaper model if primary fails
-      - Prompt caching for repeated rubrics
-    """
-    
-    def __init__(self, primary_model: str = "claude-opus-5", 
-                 fallback_model: str = "claude-sonnet-4.5"):
-        self.primary_model = primary_model
-        self.fallback_model = fallback_model
-        self.max_retries = 3
-    
-    def score(self, output: str, rubric: str, reference: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Score output against rubric.
-        
-        Returns:
-          {
-            "score": float (0-1),
-            "reasoning": str,
-            "model_used": str
-          }
-        """
-        # Try primary model with retries
-        for attempt in range(self.max_retries):
-            try:
-                result = self._call_model(self.primary_model, output, rubric, reference)
-                result["model_used"] = self.primary_model
-                return result
-            except Exception as e:
-                if attempt == self.max_retries - 1:
-                    # Fallback to cheaper model
-                    try:
-                        result = self._call_model(self.fallback_model, output, rubric, reference)
-                        result["model_used"] = self.fallback_model
-                        return result
-                    except Exception as fallback_error:
-                        return {
-                            "score": 0.0,
-                            "reasoning": f"Judge failed: {str(fallback_error)}",
-                            "model_used": "none"
-                        }
-                # Exponential backoff
-                time.sleep(2 ** attempt)
-        
-        return {"score": 0.0, "reasoning": "Max retries exceeded", "model_used": "none"}
-    
-    def _call_model(self, model: str, output: str, rubric: str, 
-                   reference: Optional[str]) -> Dict[str, Any]:
-        """Mock model call - in production, use Anthropic SDK"""
-        # Build prompt with caching
-        system_prompt = f"""You are an expert evaluator. Score the output against this rubric:
-
-{rubric}
-
-Output a JSON object:
-{{
-  "score": <float 0-1>,
-  "reasoning": "<1-2 sentence explanation>"
-}}"""
-        
-        user_prompt = f"""Output to evaluate:
-{output}
-"""
-        
-        if reference:
-            user_prompt += f"\nReference (expected output):\n{reference}\n"
-        
-        # Mock response
-        return {
-            "score": 0.85,
-            "reasoning": "Output is clear and mostly correct, minor formatting issue."
-        }
-```
-
-### Trajectory Step Scorer with Geometric Mean
-
-```python
-from typing import List
-import numpy as np
-
-class TrajectoryStepScore:
-    """Individual step evaluation"""
-    def __init__(self, tool_correct: bool, args_correct: bool, 
-                 output_valid: bool, error_handled: bool):
-        self.tool_correct = tool_correct
-        self.args_correct = args_correct
-        self.output_valid = output_valid
-        self.error_handled = error_handled
-    
-    def compute(self) -> float:
-        """
-        Weighted score for this step.
-        
-        Weights:
-          - Tool selection: 0.3
-          - Argument correctness: 0.3
-          - Output validity: 0.3
-          - Error handling: 0.1
-        """
-        score = 0.0
-        if self.tool_correct:
-            score += 0.3
-        if self.args_correct:
-            score += 0.3
-        if self.output_valid:
-            score += 0.3
-        if self.error_handled:
-            score += 0.1
-        return score
-
-def score_trajectory_geometric(steps: List[TrajectoryStepScore]) -> float:
-    """
-    Score trajectory using geometric mean.
-    
-    Geometric mean ensures that a single failing step
-    significantly impacts the overall score.
-    
-    Example:
-      steps = [1.0, 1.0, 0.5, 1.0, 1.0]
-      arithmetic mean = 0.9
-      geometric mean = 0.87 (penalizes the 0.5 more)
-    """
-    if not steps:
-        return 0.0
-    
-    scores = [step.compute() for step in steps]
-    
-    # Geometric mean: (s1 * s2 * ... * sn)^(1/n)
-    product = np.prod(scores)
-    return float(product ** (1.0 / len(scores)))
-
-# Worked example
-steps = [
-    TrajectoryStepScore(tool_correct=True, args_correct=True, output_valid=True, error_handled=True),
-    TrajectoryStepScore(tool_correct=True, args_correct=False, output_valid=True, error_handled=True),
-    TrajectoryStepScore(tool_correct=True, args_correct=True, output_valid=True, error_handled=True),
-    TrajectoryStepScore(tool_correct=True, args_correct=True, output_valid=True, error_handled=True),
-    TrajectoryStepScore(tool_correct=True, args_correct=True, output_valid=True, error_handled=True),
-]
-
-# Step scores: [1.0, 0.7, 1.0, 1.0, 1.0]
-# Geometric mean: (1.0 * 0.7 * 1.0 * 1.0 * 1.0)^(1/5) = 0.7^0.2 = 0.937
-traj_score = score_trajectory_geometric(steps)
-print(f"Trajectory score: {traj_score:.3f}")  # 0.937
-```
-
-### Online Eval Monitor with Drift Detection
-
-```python
-from collections import deque
-from dataclasses import dataclass
-import time
-import numpy as np
-
-@dataclass
-class OnlineEvalSample:
-    """Single production sample"""
-    request_id: str
-    timestamp: float
-    task_success: bool
-    trajectory_score: float
-    cost_usd: float
-    latency_ms: int
-
-class OnlineEvalMonitor:
-    """
-    Sliding-window online evaluation for production traffic.
-    
-    Features:
-      - Drift detection (compare current window vs baseline)
-      - Alerting on regression
-      - Sampling (don't eval every request)
-    """
-    
-    def __init__(self, window_size: int = 1000, sample_rate: float = 0.1,
-                 drift_threshold: float = 0.05):
-        self.window_size = window_size
-        self.sample_rate = sample_rate
-        self.drift_threshold = drift_threshold
-        
-        # Sliding window of recent samples
-        self.samples = deque(maxlen=window_size)
-        
-        # Baseline metrics (from initial eval)
-        self.baseline_pass_rate = 0.0
-        self.baseline_avg_score = 0.0
-        
-        # Alert state
-        self.alert_active = False
-    
-    def set_baseline(self, pass_rate: float, avg_score: float):
-        """Set baseline metrics from pre-deployment eval"""
-        self.baseline_pass_rate = pass_rate
-        self.baseline_avg_score = avg_score
-    
-    def should_sample(self) -> bool:
-        """Decide whether to evaluate this request (sampling)"""
-        import random
-        return random.random() < self.sample_rate
-    
-    def record(self, sample: OnlineEvalSample):
-        """Record a new evaluation sample"""
-        self.samples.append(sample)
-        
-        # Check for drift if window is full
-        if len(self.samples) >= self.window_size:
-            self._check_drift()
-    
-    def _check_drift(self):
-        """
-        Detect drift: current window vs baseline.
-        
-        Alert if:
-          - Pass rate drops > drift_threshold
-          - Average trajectory score drops > drift_threshold
-        """
-        current_pass_rate = np.mean([s.task_success for s in self.samples])
-        current_avg_score = np.mean([s.trajectory_score for s in self.samples])
-        
-        pass_rate_delta = self.baseline_pass_rate - current_pass_rate
-        score_delta = self.baseline_avg_score - current_avg_score
-        
-        if pass_rate_delta > self.drift_threshold or score_delta > self.drift_threshold:
-            if not self.alert_active:
-                self._trigger_alert(current_pass_rate, current_avg_score)
-                self.alert_active = True
-        else:
-            self.alert_active = False
-    
-    def _trigger_alert(self, current_pass_rate: float, current_avg_score: float):
-        """Send alert (Slack, PagerDuty, etc.)"""
-        message = f"""EVAL DRIFT ALERT
-
-Baseline pass rate: {self.baseline_pass_rate:.2%}
-Current pass rate: {current_pass_rate:.2%}
-Delta: {self.baseline_pass_rate - current_pass_rate:.2%}
-
-Baseline avg score: {self.baseline_avg_score:.3f}
-Current avg score: {current_avg_score:.3f}
-Delta: {self.baseline_avg_score - current_avg_score:.3f}
-
-Window size: {len(self.samples)} samples
-"""
-        print(message)  # In production: send to alerting system
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get current window statistics"""
-        if not self.samples:
-            return {}
-        
-        return {
-            "window_size": len(self.samples),
-            "pass_rate": np.mean([s.task_success for s in self.samples]),
-            "avg_trajectory_score": np.mean([s.trajectory_score for s in self.samples]),
-            "p50_latency_ms": np.percentile([s.latency_ms for s in self.samples], 50),
-            "p95_latency_ms": np.percentile([s.latency_ms for s in self.samples], 95),
-            "p99_latency_ms": np.percentile([s.latency_ms for s in self.samples], 99),
-            "avg_cost_usd": np.mean([s.cost_usd for s in self.samples]),
-            "alert_active": self.alert_active
-        }
-
-# Usage
-monitor = OnlineEvalMonitor(window_size=1000, sample_rate=0.1, drift_threshold=0.05)
-monitor.set_baseline(pass_rate=0.85, avg_score=0.92)
-
-# In production request handler
-if monitor.should_sample():
-    # Evaluate this request
-    sample = OnlineEvalSample(
-        request_id="req_123",
-        timestamp=time.time(),
-        task_success=True,
-        trajectory_score=0.88,
-        cost_usd=0.02,
-        latency_ms=1500
-    )
-    monitor.record(sample)
-
-# Periodic stats check
-stats = monitor.get_stats()
-print(f"Current window: {stats}")
-```
-
-### Dual-Oracle Eval Runtime (Hard + Soft)
-
-```python
-from typing import Callable, Any, Optional, List
-from enum import Enum
-import time
-
-class OracleType(Enum):
-    HARD = "hard"  # Exact match, deterministic
-    SOFT = "soft"  # LLM judge, probabilistic
-
-class EvalInvariant(Enum):
-    """Eval design invariants"""
-    I1 = "Orthogonal planes: harness ⊥ production ⊥ online"
-    I2 = "Judge calls <15% of production LLM cost"
-    I3 = "Eval suite passes on release candidate before deploy"
-    I4 = "Every failure mode has a test case"
-
-@dataclass
-class OracleResult:
-    """Result from an oracle (hard or soft)"""
-    oracle_type: OracleType
-    passed: bool
-    score: Optional[float] = None  # For soft oracle
-    reasoning: Optional[str] = None
-    cost_usd: float = 0.0
-    latency_ms: int = 0
-
-class EvalRuntime:
-    """
-    Dual-oracle eval runtime.
-    
-    Enforces invariants:
-      I1: Separate harness from production
-      I2: Judge cost <15% of production cost
-      I3: Release gate on pass rate
-      I4: Coverage of known failure modes
-    """
-    
-    def __init__(self, 
-                 hard_oracle: Callable[[Any, Any], bool],
-                 soft_oracle: Optional[Callable[[Any, str], OracleResult]] = None,
-                 pass_threshold: float = 0.80,
-                 judge_cost_limit_pct: float = 0.15):
-        self.hard_oracle = hard_oracle
-        self.soft_oracle = soft_oracle
-        self.pass_threshold = pass_threshold
-        self.judge_cost_limit_pct = judge_cost_limit_pct
-        
-        # Metrics
-        self.production_cost_usd = 0.0
-        self.judge_cost_usd = 0.0
-    
-    def evaluate(self, agent_output: Any, expected: Any, 
-                 rubric: Optional[str] = None) -> OracleResult:
-        """
-        Run dual-oracle evaluation.
-        
-        Flow:
-          1. Hard oracle (fast, deterministic)
-          2. If hard oracle passes, return
-          3. If hard oracle fails, invoke soft oracle (if available)
-        """
-        start = time.time()
-        
-        # Hard oracle
-        hard_passed = self.hard_oracle(agent_output, expected)
-        
-        if hard_passed:
-            return OracleResult(
-                oracle_type=OracleType.HARD,
-                passed=True,
-                latency_ms=int((time.time() - start) * 1000)
-            )
-        
-        # Soft oracle (if needed)
-        if self.soft_oracle and rubric:
-            soft_result = self.soft_oracle(agent_output, rubric)
-            self.judge_cost_usd += soft_result.cost_usd
-            
-            # Check I2: judge cost limit
-            if self.production_cost_usd > 0:
-                judge_ratio = self.judge_cost_usd / self.production_cost_usd
-                if judge_ratio > self.judge_cost_limit_pct:
-                    raise Exception(f"Judge cost {judge_ratio:.1%} exceeds limit {self.judge_cost_limit_pct:.1%}")
-            
-            return soft_result
-        
-        # No soft oracle, hard oracle failed
-        return OracleResult(
-            oracle_type=OracleType.HARD,
-            passed=False,
-            latency_ms=int((time.time() - start) * 1000)
-        )
-    
-    def evaluate_suite(self, test_cases: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Run full eval suite and enforce I3 (release gate).
-        
-        Returns pass/fail decision + metrics.
-        """
-        results = []
-        
-        for case in test_cases:
-            result = self.evaluate(
-                agent_output=case["agent_output"],
-                expected=case["expected"],
-                rubric=case.get("rubric")
-            )
-            results.append(result)
-        
-        # Aggregate
-        pass_count = sum(1 for r in results if r.passed)
-        pass_rate = pass_count / len(results)
-        
-        # I3: Release gate
-        release_approved = pass_rate >= self.pass_threshold
-        
-        return {
-            "total": len(results),
-            "passed": pass_count,
-            "pass_rate": pass_rate,
-            "release_approved": release_approved,
-            "threshold": self.pass_threshold,
-            "judge_cost_usd": self.judge_cost_usd,
-            "production_cost_usd": self.production_cost_usd
-        }
-
-# Example: Hard oracle (exact match)
-def exact_match_oracle(output: Any, expected: Any) -> bool:
-    if isinstance(output, str) and isinstance(expected, str):
-        return output.strip().lower() == expected.strip().lower()
-    return output == expected
-
-# Example: Soft oracle (LLM judge)
-def llm_judge_oracle(output: Any, rubric: str) -> OracleResult:
-    # Mock - in production, call LLM API
-    return OracleResult(
-        oracle_type=OracleType.SOFT,
-        passed=True,
-        score=0.88,
-        reasoning="Output is mostly correct, minor style issue",
-        cost_usd=0.01,
-        latency_ms=800
-    )
-
-# Usage
-runtime = EvalRuntime(
-    hard_oracle=exact_match_oracle,
-    soft_oracle=llm_judge_oracle,
-    pass_threshold=0.80,
-    judge_cost_limit_pct=0.15
-)
-
-test_cases = [
-    {"agent_output": "Paris", "expected": "Paris"},
-    {"agent_output": "paris", "expected": "Paris"},  # Case mismatch
-    {"agent_output": "London", "expected": "Paris", "rubric": "Geographic accuracy"},
-]
-
-suite_result = runtime.evaluate_suite(test_cases)
-print(f"Release approved: {suite_result['release_approved']}")
-print(f"Pass rate: {suite_result['pass_rate']:.1%}")
-```
-
-### pass@k and pass^k Implementation
-
-```python
-from math import comb
-import numpy as np
-
-def pass_at_k(n: int, c: int, k: int) -> float:
-    """
-    Unbiased estimator for pass@k.
-    
-    Args:
-        n: Total samples drawn per task
-        c: Number of correct samples
-        k: Target number of samples (k <= n)
-    
-    Returns:
-        Probability that at least one of k samples is correct
-    
-    Formula:
-        pass@k = 1 - C(n-c, k) / C(n, k)
-    
-    Example:
-        n=10, c=3, k=5
-        pass@5 = 1 - C(7,5)/C(10,5) = 1 - 21/252 = 0.917
-    """
-    if c >= k:
-        return 1.0
-    if c == 0:
-        return 0.0
-    if k > n:
-        raise ValueError(f"k ({k}) cannot exceed n ({n})")
-    
-    return 1.0 - comb(n - c, k) / comb(n, k)
-
-def pass_at_k_stable(n: int, c: int, k: int) -> float:
-    """
-    Numerically stable pass@k using product form.
-    
-    Avoids large intermediate values in binomial coefficients.
-    """
-    if c >= k:
-        return 1.0
-    if c == 0:
-        return 0.0
-    
-    # Product form: 1 - ∏(i=0 to k-1) [(n-c-i) / (n-i)]
-    product = 1.0
-    for i in range(k):
-        product *= (n - c - i) / (n - i)
-    
-    return 1.0 - product
-
-def pass_pow_k(n: int, c: int, k: int) -> float:
-    """
-    pass^k: Probability that all k samples are correct.
-    
-    Args:
-        n: Total samples drawn
-        c: Number of correct samples (must be >= k)
-        k: Target number of samples
-    
-    Returns:
-        Probability of k consecutive successes
-    
-    Formula:
-        pass^k = C(c, k) / C(n, k)
-    
-    Example:
-        n=10, c=8, k=3
-        pass^3 = C(8,3)/C(10,3) = 56/120 = 0.467
-    """
-    if c < k:
-        return 0.0
-    if c == n:
-        return 1.0
-    
-    return comb(c, k) / comb(n, k)
-
-# Demonstration: HumanEval-style analysis
-def analyze_pass_metrics(n: int, c: int, max_k: int = 10):
-    """
-    Compute pass@k and pass^k for k=1 to max_k.
-    
-    Shows how metrics diverge as k increases.
-    """
-    print(f"\nAnalysis for n={n}, c={c} correct samples\n")
-    print("k | pass@k | pass^k | Gap")
-    print("-" * 40)
-    
-    for k in range(1, min(max_k + 1, n + 1)):
-        at_k = pass_at_k_stable(n, c, k)
-        pow_k = pass_pow_k(n, c, k)
-        gap = at_k - pow_k
-        print(f"{k:2d} | {at_k:6.2%} | {pow_k:6.2%} | {gap:+6.2%}")
-
-# Example: Model with 60% single-shot accuracy
-analyze_pass_metrics(n=10, c=6, max_k=10)
-
-# Example: Anthropic tau-airline replication
-print("\nAnthropic tau-airline scenario (baseline):")
-analyze_pass_metrics(n=10, c=3, max_k=5)  # ~33% pass@1
-```
-
-## Token Economics & Cost Analysis
-
-### Cost Components
-
-**Production cost (per request):**
-```
-Cost = (Input tokens × Input price) + (Output tokens × Output price) + Tool execution cost
-
-For cached requests:
-Cost = (Cache write tokens × Write price) + (Cache read tokens × Read price) + (Uncached tokens × Input price) + (Output × Output price)
-```
-
-**Eval cost (per eval run):**
-```
-Eval cost = Production cost + Judge cost
-
-Judge cost = Judge calls × (Judge input tokens × Judge input price + Judge output tokens × Judge output price)
-```
-
-**Guardrail: Judge cost should be <15% of production LLM cost**
-
-If judge cost exceeds this, you're spending more on evaluation than production.
-
-### Platform Cost Meters
-
-| Component | Metered By | Pricing Mechanism |
-|-----------|------------|-------------------|
-| **LangSmith** | Traces ingested, storage, annotations | Free: 5k traces/month, then $30/100k traces |
-| **Braintrust** | Rows evaluated, LLM calls (judge) | Free: 100k rows/month, $100/1M rows after |
-| **Datadog** | Custom metrics, logs, APM spans | $0.10/100 custom metrics, $0.10/1M spans |
-| **Phoenix (Arize)** | Traces, storage, models monitored | Free OSS, Cloud: $99/month base + usage |
-| **Promptfoo** | Eval runs (self-hosted), cloud storage | Free OSS, Cloud: $50/month/seat |
-| **DeepEval** | Test cases, judge calls | Free OSS, Cloud: $99/month + usage |
-| **OpenAI Evals** | Self-hosted (your infra cost) | Free (but you pay OpenAI API costs) |
-
-### Per-Eval-Run Cost Example
-
-**Scenario:** Evaluate 500 test cases using Claude Opus 5 as judge
-
-**Assumptions:**
-- Production agent: Claude Sonnet 4.5
-- Judge: Claude Opus 5
-- Avg input per task: 2000 tokens (context + task)
-- Avg agent output: 500 tokens
-- Judge input: 2000 (trajectory) + 500 (rubric) = 2500 tokens
-- Judge output: 200 tokens (score + reasoning)
-
-**Production cost:**
-```
-Sonnet 4.5: $3/MTok input, $15/MTok output
-  Input: 500 × 2000 = 1M tokens → $3
-  Output: 500 × 500 = 250k tokens → $3.75
-  Total: $6.75
-```
-
-**Judge cost:**
-```
-Opus 5: $15/MTok input, $75/MTok output
-  Input: 500 × 2500 = 1.25M tokens → $18.75
-  Output: 500 × 200 = 100k tokens → $7.50
-  Total: $26.25
-```
-
-**All-in eval cost:** $6.75 + $26.25 = $33.00 for 500 test cases
-
-**Cost per test case:** $0.066
-
-**Judge-to-production ratio:** $26.25 / $6.75 = 3.9x
-
-This violates the 15% guardrail. Solutions:
-1. Use cheaper judge (Sonnet 4.5 instead of Opus 5): $26.25 → $5.25 (0.78x ratio)
-2. Sample: Only judge 20% of cases → $26.25 → $5.25
-3. Hard oracle first: Only judge when hard oracle fails (assume 20% failure) → $26.25 → $5.25
-
-### Benchmark Suite Costs
-
-| Benchmark | Size | Avg Time/Task | Judge Calls/Task | Est. Cost (Full Run) |
-|-----------|------|---------------|------------------|----------------------|
-| **SWE-bench** | 2,294 | 5-10 min | 1 (exact match) | $500-1000 (agent execution, no judge) |
-| **SWE-bench Lite** | 500 | 5-10 min | 1 | $100-200 |
-| **SWE-bench Verified** | 731 | 5-10 min | 1 | $150-300 |
-| **GAIA** | 466 | 2-5 min | 1-3 (multi-step) | $50-150 |
-| **GAIA 2** | 690 | 2-5 min | 1-3 | $75-225 |
-| **tau-bench** | 1,200 (airline+retail) | 1-3 min | 1 | $100-300 |
-| **HumanEval** | 164 | <1 min | 0 (unit test) | $5-10 |
-| **HumanEval+** | 164 (80x tests) | <1 min | 0 | $5-10 |
-| **MATH** | 12,500 | <1 min | 0 (symbolic check) | $50-100 |
-| **HealthBench** | 5,000 | 1-2 min | ~11/example | $500-1000 |
-| **BFCL V4** | ~2,000 | <1 min | 0 (tool call match) | $20-50 |
-
-**Note:** Costs assume agent execution + judge calls. Does not include:
-- Platform fees (LangSmith, Braintrust)
-- Infra overhead (workers, storage)
-- Retries or k-sample runs (multiply by k)
-
-### Cost Optimization Strategies
-
-| Strategy | Cost Reduction | Trade-off |
-|----------|----------------|-----------|
-| **1. Cheap judge first, escalate** | 60-80% | May miss subtle quality gaps |
-| Use Haiku/Sonnet as first-pass, Opus only for edge cases | | |
-| **2. Sampling** | 50-90% | Lose coverage, higher variance |
-| Evaluate 10-20% of production traffic | | |
-| **3. Hard oracle preference** | 80-95% | Only works when ground truth exists |
-| Skip judge if exact match passes | | |
-| **4. Prompt caching** | 40-60% on judge input | Only helps on repeated rubrics |
-| Cache rubric + few-shot examples | | |
-| **5. Batching** | 10-20% | Higher latency, infra complexity |
-| Batch 100+ requests to amortize overhead | | |
-
-### Judge-Token Reference Loop
-
-**Problem:** If the judge needs to see the full agent trajectory, and the trajectory is long (many tool calls, large outputs), judge input tokens can exceed production input tokens.
-
-**Example:**
-```
-Production agent:
-  Input: 1000 tokens (user query + context)
-  Output: 500 tokens (answer)
-
-Judge sees:
-  Agent input: 1000 tokens
-  Agent output: 500 tokens
-  Tool calls (5 × 200 tokens): 1000 tokens
-  Rubric: 500 tokens
-  Total judge input: 3000 tokens (3x production input)
-```
-
-**Mitigation:**
-1. Summarize trajectory before sending to judge (loses fidelity)
-2. Use component-level grading (tool selection, args) instead of full trajectory
-3. Hard oracle first, judge only on failures
-
-### All-In Cost Examples
-
-**Scenario A: RAG Eval (500 tasks)**
-```
-Production:
-  Model: Sonnet 4.5
-  Avg input: 3000 tokens (context + query)
-  Avg output: 300 tokens
-  Cost: (500 × 3000 × $3/MTok) + (500 × 300 × $15/MTok) = $4.50 + $2.25 = $6.75
-
-Judge (RAGAS faithfulness):
-  Model: Sonnet 4.5
-  Avg input: 3000 (context) + 300 (answer) + 500 (rubric) = 3800 tokens
-  Avg output: 100 tokens
-  Cost: (500 × 3800 × $3/MTok) + (500 × 100 × $15/MTok) = $5.70 + $0.75 = $6.45
-
-Platform (Braintrust):
-  500 rows = Free tier
-
-Total: $6.75 + $6.45 = $13.20
-Cost per task: $0.026
-```
-
-**Scenario B: Agent Eval (100 tasks, long trajectories)**
-```
-Production:
-  Model: Opus 5
-  Avg input: 2000 tokens
-  Avg output: 5000 tokens (multi-step reasoning + tool calls)
-  Cost: (100 × 2000 × $15/MTok) + (100 × 5000 × $75/MTok) = $3.00 + $37.50 = $40.50
-
-Judge:
-  Model: Sonnet 4.5 (cheaper)
-  Avg input: 5000 (full trajectory) + 500 (rubric) = 5500 tokens
-  Avg output: 200 tokens
-  Cost: (100 × 5500 × $3/MTok) + (100 × 200 × $15/MTok) = $1.65 + $0.30 = $1.95
-
-Platform (LangSmith):
-  100 traces = Free tier
-
-Total: $40.50 + $1.95 = $42.45
-Cost per task: $0.42
-Judge ratio: $1.95 / $40.50 = 4.8% ✓ (under 15% limit)
-```
-
-### Latency & Throughput
-
-**Two clocks to track:**
-
-1. **User-facing latency:** Time from request to response (production only)
-   - Eval harness runs offline, no user impact
-   - Target: 0ms overhead (eval is async)
-
-2. **Eval time-to-score:** Time from trace capture to score available
-   - Pointwise (single request): <1 second (for real-time dashboards)
-   - Batch (nightly suite): <1 hour for 1000 tasks
-   - Online monitoring: <5 minutes for drift detection
-
-**Latency SLA Targets:**
-
-| Eval Tier | p50 | p95 | p99 | Use Case |
-|-----------|-----|-----|-----|----------|
-| **Inline** (sync judge) | 500ms | 1s | 2s | Real-time quality gate (risky) |
-| **Sidecar** (async judge) | 2s | 5s | 10s | Production monitoring |
-| **Batch** (nightly CI) | 10s | 30s | 60s | Pre-deployment suite |
-| **One-off** (ad-hoc research) | No SLA | No SLA | No SLA | Exploratory analysis |
-
-**Throughput ceilings:**
-
-| System | Max Tasks/Hour | Limiting Factor |
-|--------|----------------|-----------------|
-| **LangSmith** | ~10,000 | API rate limits (100 req/s) |
-| **Braintrust** | ~50,000 | Ingest pipeline capacity |
-| **Self-hosted** | ~100,000+ | Worker pool size |
-| **GAIA 2 (official)** | ~700/day | Human-in-loop verification |
-| **SWE-bench (official)** | ~100/day | Sandbox reset time (5-10 min/task) |
-
-**Back-pressure design:**
-When eval throughput < production throughput, use sampling or queue shedding:
-
-```python
-class EvalQueue:
-    def __init__(self, max_queue_size: int = 10000):
-        self.queue = []
-        self.max_queue_size = max_queue_size
-        self.dropped_count = 0
-    
-    def enqueue(self, trace):
-        if len(self.queue) < self.max_queue_size:
-            self.queue.append(trace)
-        else:
-            self.dropped_count += 1
-            # Optionally: reservoir sampling to maintain random sample
-    
-    def drop_rate(self) -> float:
-        total = len(self.queue) + self.dropped_count
-        return self.dropped_count / total if total > 0 else 0.0
-```
-
-**Capacity planning worked example:**
-
-```
-Target: Evaluate 10% of production traffic
-Production rate: 1000 req/s
-Eval rate needed: 100 req/s
-
-Per-eval latency:
-  Agent execution (replay): 2s
-  Judge scoring: 1s
-  Total: 3s
-
-Worker capacity per worker: 1/3 req/s (3s latency)
-Workers needed: 100 / (1/3) = 300 workers
-
-Cost:
-  300 workers × $0.01/hour (spot instance) = $3/hour = $2,160/month
-  LLM costs: 100 req/s × 3600s × 24h × 30d = 259M requests/month
-  At $0.01/request → $2.59M/month (judge + agent execution)
-
-Conclusion: 10% sampling is too expensive. Reduce to 1% → $0.30/hour infra + $259k/month LLM.
-```
-
-## Trade-offs & Failure Modes
-
-### LLM-as-Judge Biases (Taxonomy with Severity)
-
-| Bias Type | Severity | Description | Mitigation |
-|-----------|----------|-------------|------------|
-| **Position Bias** | High | Judge prefers first or last response in pairwise comparison | Swap order, aggregate |
-| - GPT-4 changed preference ~1/3 of cases when order swapped (Zheng et al.) | | | |
-| **Length/Verbosity Bias** | Medium-High | Longer responses score higher regardless of quality | Normalize by length, explicit rubric |
-| **Self-Preference Bias** | Medium | Model prefers its own outputs over others | Use different model as judge |
-| **Rubric Position Bias** | Medium | Judge scores first rubric item higher (2026 finding) | Randomize rubric order |
-| **Compounding Biases** | High | Multiple biases interact (FairJudge Feb 2026: >50% error rates) | Ensemble judges, human calibration |
-
-**Position bias example (Zheng et al.):**
-```
-Prompt: "Which is better, A or B?"
-  A: Short answer
-  B: Long answer
-  Judge: "B is better" (60% of time)
-
-Swapped:
-  B: Long answer
-  A: Short answer
-  Judge: "A is better" (55% of time)
-
-Actual preference: Indeterminate due to position+length bias
-```
-
-**Mitigation: Position swap + aggregate**
-```python
-def pairwise_judge_debiased(response_a: str, response_b: str, rubric: str) -> str:
-    """Run pairwise comparison twice with swapped order, aggregate"""
-    # Forward
-    score_forward = judge(f"A: {response_a}\nB: {response_b}\n{rubric}")
-    # Reverse
-    score_reverse = judge(f"A: {response_b}\nB: {response_a}\n{rubric}")
-    
-    # If both agree, return
-    if score_forward == "A" and score_reverse == "B":
-        return "A_wins"
-    elif score_forward == "B" and score_reverse == "A":
-        return "B_wins"
-    else:
-        return "Tie"  # Disagreement due to position bias
-```
-
-### Judge Validation Protocol
-
-Before deploying an LLM judge in production, validate:
-
-1. **Inter-judge agreement:** Run 2+ models as judges on same dataset, measure Cohen's kappa
-   - Target: kappa >= 0.6 (substantial agreement)
-   - If kappa < 0.4, judges are unreliable
-
-2. **Human alignment:** Sample 100+ judgments, have humans label, measure agreement
-   - Target: >= 80% agreement with human majority vote
-   - RAGAS faithfulness achieves ~95% human agreement
-
-3. **Bias audit:** Test for position, length, self-preference bias
-   - Swap orders, normalize lengths, cross-model judging
-
-4. **Calibration:** Anchor judge on known-good and known-bad examples
-   - Show 5-10 examples before eval: "This is a score-5 response... This is a score-1 response..."
-
-5. **Drift monitoring:** Re-validate monthly (model updates can change judge behavior)
-
-### LLM-as-Judge Calibration Anchors
-
-| Benchmark | Human-Judge Agreement | Caveat |
-|-----------|----------------------|--------|
-| **RAGAS Faithfulness** | ~95% | Only for RAG factuality, not general quality |
-| **AlpacaEval** | ~86% (GPT-4 vs human) | Length bias: longer = better |
-| **MT-Bench** | ~80% (GPT-4 vs human) | Position bias in pairwise mode |
-| **Arena-Hard** | ~90% (GPT-4-turbo vs human) | Crowd-sourced, noisy labels |
-| **HHH (Helpful/Harmless/Honest)** | ~75% | Subjective, low inter-annotator agreement |
-| **SimpleQA** | 100% (hard-coded) | Binary factuality, no judge needed (but useful as a pattern) |
-| **FairJudge (Feb 2026)** | Baseline: 50% error rate | Exposed compounding biases in prior judges |
-
-### Human Evaluation: Inter-Annotator Agreement
-
-When using human labels as ground truth, measure inter-annotator agreement (IAA):
-
-**Cohen's kappa:**
-```
-kappa = (p_observed - p_expected) / (1 - p_expected)
-
-where:
-  p_observed = proportion of agreement
-  p_expected = proportion of agreement by chance
-```
-
-**Interpretation:**
-- kappa < 0.2: Slight agreement
-- 0.2-0.4: Fair
-- 0.4-0.6: Moderate
-- 0.6-0.8: Substantial
-- 0.8-1.0: Almost perfect
-
-**Target by task type:**
-
-| Task | Target Kappa | Rationale |
-|------|--------------|-----------|
-| **Factuality** (binary) | >= 0.8 | Objective, clear ground truth |
-| **Relevance** (1-5 scale) | >= 0.6 | Some subjectivity |
-| **Helpfulness** (1-5 scale) | >= 0.5 | Highly subjective |
-| **Trajectory quality** | >= 0.4 | Complex, multi-dimensional |
-
-**Kappa prevalence paradox:** High agreement can still yield low kappa if the distribution is skewed.
-
-Example:
-```
-100 samples, 95 are positive, 5 are negative
-Annotators agree on 96/100 (96% agreement)
-But kappa = 0.5 (moderate) because chance agreement is high
-```
-
-Solution: Report both raw agreement and kappa.
-
-### Chain-of-Thought for Judge Reliability
-
-**Finding:** Asking judges to produce reasoning before scoring improves agreement with humans.
-
-**Experiment (Anthropic, 2025):**
-- Without CoT: Judge-human agreement ~0.55 (kappa)
-- With CoT: Judge-human agreement ~0.75 (kappa)
-
-**Pattern:**
-```python
-def judge_with_cot(output: str, rubric: str) -> Dict[str, Any]:
-    prompt = f"""Evaluate this output against the rubric.
-
-Output:
-{output}
-
-Rubric:
-{rubric}
-
-First, provide your reasoning (2-3 sentences). Then, provide a score 1-5.
-
-Format:
-Reasoning: <your reasoning>
-Score: <1-5>
-"""
-    
-    response = llm(prompt)
-    # Parse reasoning and score
-    reasoning = extract_reasoning(response)
-    score = extract_score(response)
-    
-    return {"score": score, "reasoning": reasoning}
-```
-
-**Calibration protocol (4 steps):**
-
-1. **Anchor examples:** Show 5-10 calibration examples (known scores) before eval
-2. **Chain-of-thought:** Force judge to explain reasoning first
-3. **Multi-turn refinement:** Let judge revise initial score after seeing own reasoning
-4. **Ensemble:** Run 2-3 judges, take majority vote or average
-
-### Benchmark Reward Hacking
-
-**UC Berkeley RDI (April 2026) study:** Intentionally broke all 8 major LLM benchmarks by exploiting eval implementation bugs.
-
-**Findings:**
-- SWE-bench: 19.78% of "resolved" issues were semantically incorrect but passed unit tests
-- GAIA: Agents cached API responses, replayed on retry (inflated pass@k)
-- MATH: LaTeX formatting tricks fooled symbolic checker
-- HumanEval: Hardcoded solutions for common prompts
-- AlpacaEval: Optimized for verbosity (length bias)
-- MT-Bench: Position bias in pairwise mode
-- MMLU: Memorized test set (contamination)
-- GSM8K: Relied on calculator tool without checking arithmetic validity
-
-**Takeaway:** Treat benchmark numbers as upper bounds, not ground truth. Always inspect failures manually.
-
-### SWE-bench Contamination & Inflation
-
-**Problem:** 19.78% of SWE-bench "passes" were semantically incorrect.
-
-**Example:**
-```
-Task: Fix bug in function `calculate_discount`
-Expected: Correctly apply 10% discount
-Agent solution: Hardcode return value for test cases, logic still broken
-Test: Passes (only tests known cases)
-Semantic correctness: Fail (breaks on new inputs)
-```
-
-**Mitigation:**
-- SWE-bench Verified (731 tasks): Human-reviewed for semantic correctness
-- Test scaling (HumanEval+): Increase test coverage 80x
-- Holdout test sets: Don't publish, rotate monthly
-
-**GAIA 2 Mitigations:**
-- 690 new tasks (vs 466 in GAIA 1)
-- API response randomization (prevents caching)
-- Human-in-loop verification (every agent pass is manually reviewed)
-
-### Contamination Controls
-
-| Control Type | Description | Example | Effectiveness |
-|--------------|-------------|---------|---------------|
-| **Holdout sets** | Unpublished test sets, rotated periodically | Google Gemini leaderboard (rotates monthly) | High (until leaked) |
-| **Canary tokens** | Unique identifiers embedded in test data to detect leaks | SWE-bench ticket IDs | High (detects but doesn't prevent) |
-| **Time-based splits** | Test on data after model's cutoff date | GAIA 2 (created after GPT-4 training) | Medium (models still learn patterns) |
-| **Dynamic generation** | Generate new tasks on-the-fly | MATH (symbolic algebra, infinite variants) | High (hard to memorize) |
-| **Human verification** | Manual review of every "pass" | GAIA 2, SWE-bench Verified | Very high (expensive) |
-
-### SimpleQA as Refusal-Aware Hard-Gate Pattern
-
-**SimpleQA (Anthropic, 2025):** 4,326 fact-seeking questions, model must answer or refuse.
-
-**Scoring:**
-```
-if model refuses and should refuse:
-    score = 1 (correct)
-elif model answers and answer is correct:
-    score = 1
-else:
-    score = 0
-```
-
-**Key insight:** Refusal is a valid response. Many benchmarks penalize "I don't know" even when correct.
-
-**Pattern:** Refusal-aware eval
-```python
-def score_with_refusal(agent_output: str, expected: str, is_answerable: bool) -> float:
-    if not is_answerable:
-        # Should refuse
-        if "I don't know" in agent_output or "Cannot answer" in agent_output:
-            return 1.0
-        else:
-            return 0.0  # Hallucination
-    else:
-        # Should answer correctly
-        if agent_output == expected:
-            return 1.0
-        elif "I don't know" in agent_output:
-            return 0.0  # False refusal
-        else:
-            return 0.0  # Wrong answer
-```
-
-### RAGAS-Class Metrics (RAG Evaluation)
-
-**RAGAS Faithfulness:**
-```
-Faithfulness = (Number of claims supported by context) / (Total claims in answer)
-
-Algorithm:
-  1. Extract claims from answer (LLM call: "List all factual claims")
-  2. For each claim, check if supported by retrieved context (LLM call: "Is this claim supported?")
-  3. Aggregate: faithful claims / total claims
-```
-
-**Example:**
-```
-Retrieved context: "Paris is the capital of France. It has a population of 2.1M."
-Answer: "Paris is the capital of France and has 10M people."
-
-Claims:
-  1. "Paris is the capital of France" → Supported ✓
-  2. "Paris has 10M people" → Not supported ✗ (context says 2.1M)
-
-Faithfulness = 1/2 = 0.5
-```
-
-**DeepEval Differences:**
-- RAGAS: Focuses on faithfulness (factual grounding)
-- DeepEval: Adds answer relevance (does answer address query?)
-
-**Citation Correctness (2026 addition):**
-```
-Citation Correctness = (Correct citations) / (Total citations)
-
-A citation is correct if:
-  1. The cited source is in the retrieved context
-  2. The cited claim is actually in that source
-```
-
-**Self-RAG (2024):**
-Adds retrieval necessity check:
-```
-if query requires external knowledge:
-    retrieve()
-else:
-    answer from parametric memory (no retrieval)
-```
-
-### Trajectory vs Stateless Tool-Call Eval
-
-| Stage | Stateless (BFCL) | Trajectory (SWE-bench) |
-|-------|------------------|------------------------|
-| **Input** | Single tool call | Sequence of tool calls |
-| **Context** | No history | Full conversation + state |
-| **Complexity** | Low (1 call) | High (multi-step reasoning) |
-| **Eval metric** | Exact match (tool + args) | End-to-end task success |
-| **Example** | "Call `get_weather(city='SF')`" | "Fix GitHub issue #1234" |
-| **Failure mode** | Wrong tool or args | Correct tools, wrong order |
-| **Judge needed?** | No (hard oracle) | Often yes (trajectory quality) |
-
-**BFCL V4 Weights (Berkeley Function-Calling Leaderboard):**
-- Agentic (multi-step): 40%
-- Multi-Turn (conversational): 30%
-- Live (real API execution): 10%
-- Non-Live (mocked): 10%
-- Hallucination detection: 10%
-
-Shows evolution from stateless (V1) to trajectory-aware (V4).
-
-### AgentLens: Lucky Pass Detection
-
-**AgentLens (Microsoft Research, 2026):** Analyzed 10,000 agent runs, found 10.7% were "lucky passes."
-
-**Lucky pass:** Agent succeeded but for the wrong reason.
-
-**Example:**
-```
-Task: Book a flight from SFO to JFK on March 15
-Expected: search_flights(origin="SFO", dest="JFK", date="2026-03-15") → book_flight(flight_id)
-
-Lucky pass:
-  Agent: search_flights(origin="SFO", dest="JFK", date="2026-03-16")  # Wrong date
-  But: Only one flight in results (API returned same flight for both dates due to bug)
-  Agent: book_flight(flight_id) → Success ✓
-
-Eval: Passed (booked correct flight)
-Reality: Agent made a mistake but got lucky
-```
-
-**Detection:** Run same task multiple times with different random seeds. If pass rate < 100%, some passes are lucky.
-
-### Complexity of k-Sample Evals
-
-**Problem:** Estimating pass@k requires drawing n >= k samples per task. For k=100, that's expensive.
-
-**Workaround:** Stratified sampling
-```python
-def stratified_pass_at_k(pass_at_1: float, k: int) -> float:
-    """
-    Estimate pass@k from pass@1 assuming independence.
-    
-    pass@k ≈ 1 - (1 - pass@1)^k
-    
-    Caveat: Assumes samples are independent (often false for agents)
-    """
-    return 1 - (1 - pass_at_1) ** k
-
-# Example: pass@1 = 0.3, estimate pass@10
-# pass@10 ≈ 1 - (1 - 0.3)^10 = 1 - 0.028 = 0.972
-```
-
-**When this breaks:** If failures are correlated (e.g., all retries hit same API rate limit), independence assumption fails.
-
-**Better approach:** Draw k samples, compute pass@k directly (more expensive but accurate).
-
-## Production Patterns & Best Practices
-
-### Non-Functional Requirements (NFRs) for Eval Systems
-
-| NFR | Target | Measurement |
-|-----|--------|-------------|
-| **Availability** | 99.9% uptime | Eval system can score traces even during outages (queue + retry) |
-| **RPO** (Recovery Point Objective) | <1 hour | Max data loss if eval system crashes |
-| **RTO** (Recovery Time Objective) | <15 minutes | Max downtime before eval resumes |
-| **Compliance** | GDPR, HIPAA (if applicable) | PII redaction, audit trails |
-| **Correctness** | <1% eval errors | Judge hallucination rate, false positive/negative rate |
-| **Eval as Product** | Customer-facing metrics | Expose eval scores to end-users (transparency) |
-
-### Flaky CI Mitigations
-
-**Problem:** Non-deterministic agent behavior causes CI flakiness (eval passes locally, fails in CI).
-
-**Sources of flakiness:**
-1. Temperature > 0 (sampling variance)
-2. Tool execution depends on external state (APIs, databases)
-3. Race conditions (parallel tool calls)
-4. Infrastructure noise (GPU placement, quantization)
-
-**Mitigations:**
-
-| Mitigation | Effectiveness | Trade-off |
-|------------|---------------|-----------|
-| **Set temperature=0** | Medium | Still non-deterministic (tie-breaking) |
-| **Mock external APIs** | High | Loses real-world accuracy |
-| **Retry failed tests (3x)** | Medium | Masks real issues, inflates pass rate |
-| **k-sample tests (pass@3)** | High | Slower, more expensive |
-| **Seed pinning** | Low | Only works for sampling, not tools |
-| **Idempotent tool execution** | High | Requires tool redesign |
-
-**Best practice:** Use pass@3 with temperature=0 for CI. If any of 3 runs passes, test passes.
-
-```python
-def ci_eval_task(task_id: str, agent: Agent, k: int = 3) -> bool:
-    """
-    CI eval: Pass if any of k runs succeeds.
-    
-    Tolerates flakiness while catching regressions.
-    """
-    successes = 0
-    for i in range(k):
-        result = agent.run(task_id, temperature=0, seed=i)
-        if result.success:
-            successes += 1
-    
-    # Pass if at least 1 success
-    return successes >= 1
-```
-
-### Online Eval Resilience
-
-**Challenge:** Production traffic is unpredictable. Eval system must not fall over.
-
-**Resilience patterns:**
-
-**1. Sampling (1-10% of traffic)**
-```python
-import random
-
-def should_evaluate() -> bool:
-    return random.random() < 0.1  # 10% sample rate
-```
-
-**2. Drift detection (sliding window)**
-```python
-class DriftDetector:
-    def __init__(self, window_size: int = 1000, threshold: float = 0.05):
-        self.window = deque(maxlen=window_size)
-        self.baseline_mean = 0.0
-        self.threshold = threshold
-    
-    def record(self, score: float):
-        self.window.append(score)
-        if len(self.window) >= self.window_size:
-            current_mean = np.mean(self.window)
-            if abs(current_mean - self.baseline_mean) > self.threshold:
-                alert("Drift detected!")
-```
-
-**3. Judge consistency checks**
-Run same trace through judge multiple times, check variance:
-```python
-def judge_consistency_check(trace, rubric, n=3) -> float:
-    scores = [judge(trace, rubric) for _ in range(n)]
-    std = np.std(scores)
-    return std  # Should be <0.1 for consistent judge
-```
-
-### Checkpointing for Long-Running Suites
-
-**Problem:** SWE-bench takes 10+ hours to run. If the run crashes at hour 9, you lose all progress.
-
-**Solution:** Checkpoint every N tasks, resume on failure.
-
-```python
-import json
-import os
-
-class CheckpointedEvalRunner:
-    def __init__(self, checkpoint_file: str = "eval_checkpoint.json"):
-        self.checkpoint_file = checkpoint_file
-        self.completed_tasks = self._load_checkpoint()
-    
-    def _load_checkpoint(self) -> set:
-        if os.path.exists(self.checkpoint_file):
-            with open(self.checkpoint_file) as f:
-                return set(json.load(f)["completed"])
-        return set()
-    
-    def _save_checkpoint(self):
-        with open(self.checkpoint_file, "w") as f:
-            json.dump({"completed": list(self.completed_tasks)}, f)
-    
-    def run_suite(self, tasks: List[str]):
-        for task_id in tasks:
-            if task_id in self.completed_tasks:
-                continue  # Skip already completed
-            
-            result = evaluate_task(task_id)
-            self.completed_tasks.add(task_id)
-            self._save_checkpoint()  # Checkpoint after each task
-```
-
-### Eval Governance & Compliance
-
-**EU AI Act Context (August 2026):**
-- High-risk AI systems must maintain evaluation logs for 10 years
-- Eval datasets must be representative (no demographic bias)
-- Judge decisions must be auditable (explainability requirement)
-
-**Implications:**
-- Store eval traces, scores, judge reasoning permanently
-- Demographic stratification (if applicable): test on diverse user groups separately
-- Judge transparency: Always log judge prompt + response, never hide reasoning
-
-**RBAC for Eval (4-Role Model):**
-
-| Role | Permissions | Example |
-|------|-------------|---------|
-| **Viewer** | Read eval results, dashboards | Product manager checking pass rate |
-| **Runner** | Trigger eval runs, view results | Eng running nightly CI |
-| **Editor** | Modify eval datasets, rubrics | ML Eng tuning judge prompts |
-| **Admin** | Grant permissions, delete data | Security team enforcing retention |
-
-**PII in Evaluation Data:**
-
-**Problem:** Production traces may contain PII (names, emails, SSNs).
-
-**Pipeline:**
-1. **Detection:** Regex + NER model to flag PII
-2. **Redaction:** Replace PII with placeholders (`<EMAIL>`, `<SSN>`)
-3. **Audit trail:** Log what was redacted, when, by whom
-4. **Judge training:** Train judge on redacted data (ensures judge doesn't see PII)
-
-```python
-import re
-
-def redact_pii(text: str) -> str:
-    # Email
-    text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', '<EMAIL>', text)
-    # SSN
-    text = re.sub(r'\b\d{3}-\d{2}-\d{4}\b', '<SSN>', text)
-    # Phone
-    text = re.sub(r'\b\d{3}-\d{3}-\d{4}\b', '<PHONE>', text)
-    return text
-```
-
-**Audit Trail Requirements:**
-- Who triggered the eval?
-- What dataset was used?
-- What model/judge was used?
-- What was the result?
-- When was it run?
-- What data was redacted?
-
-Store in immutable log (append-only, no deletes).
-
-### Governance Platforms
-
-| Platform | Focus | Key Features | Pricing |
-|----------|-------|--------------|---------|
-| **Braintrust** | Eval + observability | Dataset versioning, judge management, RBAC | Free 100k rows, $100/1M after |
-| **Galileo** | LLM observability | Guardrails, drift detection, hallucination detection | Enterprise (custom) |
-| **Credo AI** | Governance + compliance | Bias audits, EU AI Act compliance, model cards | Enterprise (custom) |
-| **Lakera** | Safety + red-teaming | Jailbreak detection, adversarial eval, prompt injection defense | Enterprise (custom) |
-| **Bifrost** | Alignment + RLHF | Constitutional AI, human preference tuning, reward modeling | Research preview |
-
-## System Design Scenarios
-
-### Scenario A: RAG Eval Pipeline (Financial Services)
-
-**Context:**
-- Customer support chatbot for banking
-- RAG retrieves from internal knowledge base (policies, FAQs)
-- Must be factually accurate (regulatory requirement)
-- Volume: 10k queries/day
-- SLA: 99.9% accuracy, <5s latency
-
-**Requirements:**
-1. Eval every response for faithfulness (no hallucinations)
-2. Detect drift (knowledge base updates)
-3. Audit trail for compliance
-4. Cost: <$1000/month for eval
-
-**Design:**
-
-```
-┌──────────────────┐
-│  User Query      │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│  RAG Retriever   │  Fetch top-5 docs
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│  LLM (Sonnet)    │  Generate answer
-└────────┬─────────┘
-         │
-         ├─────────────────────┐
-         │                     │
-         ▼                     ▼
-┌──────────────────┐   ┌──────────────────┐
-│  User Response   │   │  Eval Sidecar    │  (async, 10% sample)
-└──────────────────┘   └────────┬─────────┘
-                                │
-                                ▼
-                       ┌──────────────────┐
-                       │ Faithfulness     │  RAGAS metric
-                       │ Judge (Haiku)    │
-                       └────────┬─────────┘
-                                │
-                                ▼
-                       ┌──────────────────┐
-                       │  Score Store     │  Braintrust
-                       │  + Audit Log     │
-                       └────────┬─────────┘
-                                │
-                                ▼
-                       ┌──────────────────┐
-                       │ Drift Detector   │  Alert on <95% faithfulness
-                       └──────────────────┘
-```
-
-**Metrics:**
-- Faithfulness: >=95% (hard requirement)
-- Answer relevance: >=90%
-- Citation correctness: >=95%
-- Latency (eval): <1s p95
-
-**Cost estimate:**
-```
-Production:
-  10k queries/day × 30 days = 300k queries/month
-  Avg 2000 input tokens, 300 output tokens
-  Sonnet 4.5: (300k × 2000 × $3/MTok) + (300k × 300 × $15/MTok) = $1,800 + $1,350 = $3,150/month
-
-Eval (10% sample):
-  30k queries/month
-  Judge: Haiku (cheap)
-  Avg 2500 input tokens (context + answer + rubric), 100 output tokens
-  Haiku: (30k × 2500 × $0.25/MTok) + (30k × 100 × $1.25/MTok) = $18.75 + $3.75 = $22.50/month
-
-Platform (Braintrust):
-  30k rows/month = Free tier
-
-Total eval cost: $22.50/month ✓ (under $1000 budget)
-Judge ratio: $22.50 / $3,150 = 0.7% ✓ (under 15%)
-```
-
-**Failure modes:**
-1. Knowledge base updated, judge still uses old rubric → Solution: Version rubrics with KB snapshots
-2. Judge hallucinates, says answer is faithful when it's not → Solution: Human spot-check 1% of judge outputs monthly
-3. Drift detector fires false alarms (variance, not real drift) → Solution: Require 2 consecutive windows below threshold
-
-### Scenario B: Agent Deployment Quality Gate (Billing System)
-
-**Context:**
-- Agentic system for processing invoices (reads PDF, extracts line items, updates database)
-- Replacing manual process (95% accuracy baseline)
-- Must not degrade quality
-- Volume: 1000 invoices/day
-- SLA: >=95% extraction accuracy
-
-**Requirements:**
-1. Pre-deployment eval: Agent must score >=95% on holdout test set (100 invoices) before deploy
-2. Post-deployment: Monitor extraction accuracy on 10% of production traffic
-3. If accuracy drops below 90%, auto-rollback
-
-**Design:**
-
-```
-┌──────────────────┐
-│  Eval Harness    │  Pre-deployment
-│  (100 test PDFs) │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│  Agent (v2)      │  Extract line items
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│  Hard Oracle     │  Compare to gold labels
-│  (Exact Match)   │  (manually labeled)
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│  Release Gate    │  If pass@1 >=95%, deploy
-│                  │  Else: block
-└────────┬─────────┘
-         │ (Deploy)
-         ▼
-┌──────────────────┐
-│  Production      │
-│  (1000 PDFs/day) │
-└────────┬─────────┘
-         │
-         ├─────────────────────┐
-         │                     │
-         ▼                     ▼
-┌──────────────────┐   ┌──────────────────┐
-│  Database Update │   │  Online Monitor  │  (10% sample)
-└──────────────────┘   └────────┬─────────┘
-                                │
-                                ▼
-                       ┌──────────────────┐
-                       │  Spot-Check      │  Human verifies extraction
-                       │  (100 PDFs/day)  │
-                       └────────┬─────────┘
-                                │
-                                ▼
-                       ┌──────────────────┐
-                       │  Accuracy Calc   │  Rolling 7-day window
-                       └────────┬─────────┘
-                                │
-                                ▼
-                       ┌──────────────────┐
-                       │  Auto-Rollback   │  If <90%, revert to v1
-                       └──────────────────┘
-```
-
-**Metrics:**
-- Pre-deploy pass@1: >=95%
-- Production accuracy (7-day rolling): >=95%
-- Rollback trigger: <90% for 2 consecutive days
-
-**Cost estimate:**
-```
-Pre-deployment eval:
-  100 test invoices
-  Agent execution: 100 × $0.10/invoice = $10
-  One-time cost per release
-
-Online monitoring:
-  1000 invoices/day × 10% = 100/day × 30 days = 3000/month
-  Human spot-check: 100/day × 30 × $5/hour × 0.1 hours = $1,500/month
-  Agent execution: 3000 × $0.10 = $300/month
-
-Total: $1,800/month (mostly human labor, not LLM)
-```
-
-**Failure modes:**
-1. Test set not representative → Production accuracy lower than test accuracy → Solution: Refresh test set quarterly from production samples
-2. Human spot-checks are slow → Accuracy calculation lags → Solution: Async queue, calculate accuracy with 1-day delay
-3. Auto-rollback triggers during maintenance window (false alarm) → Solution: Disable auto-rollback during announced maintenance
-
-### Scenario C: Dual-Oracle for Policy-Bound Support Agent
-
-**Context:**
-- Customer support agent with strict policy constraints (refund limits, eligibility rules)
-- Must follow policy exactly (hard oracle)
-- But also be helpful/empathetic (soft oracle)
-- Volume: 5k conversations/day
-- SLA: 100% policy compliance, >=90% helpfulness
-
-**Design:**
-
-```
-┌──────────────────┐
-│  User Message    │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│  Agent Response  │
-└────────┬─────────┘
-         │
-         ├─────────────────────────────┐
-         │                             │
-         ▼                             ▼
-┌──────────────────┐         ┌──────────────────┐
-│  Hard Oracle     │         │  Soft Oracle     │
-│  (Policy Check)  │         │  (LLM Judge)     │
-│                  │         │                  │
-│  - Refund amount │         │  - Helpfulness   │
-│  - Eligibility   │         │  - Empathy       │
-│  - Escalation    │         │  - Clarity       │
-└────────┬─────────┘         └────────┬─────────┘
-         │                             │
-         └──────────┬──────────────────┘
-                    │
-                    ▼
-           ┌──────────────────┐
-           │  Dual-Oracle      │  Hard: must pass
-           │  Aggregator       │  Soft: >=90% target
-           └────────┬─────────┘
-                    │
-                    ├─────────────────┬─────────────────┐
-                    │                 │                 │
-                    ▼                 ▼                 ▼
-           ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-           │ Pass          │  │ Soft Fail    │  │ Hard Fail    │
-           │ (ship)        │  │ (warn)       │  │ (block)      │
-           └───────────────┘  └──────────────┘  └──────────────┘
-```
-
-**Hard Oracle Rules:**
-```python
-def policy_oracle(response: str, context: Dict) -> bool:
-    """Hard oracle: policy compliance"""
-    # Extract agent actions
-    refund_amount = extract_refund_amount(response)
-    eligibility_checked = check_eligibility_verified(response, context)
-    
-    # Policy rules
-    if refund_amount > context["order_total"]:
-        return False  # Cannot refund more than order total
-    
-    if refund_amount > 0 and not eligibility_checked:
-        return False  # Must check eligibility before refunding
-    
-    if context["account_age_days"] < 30 and not escalated(response):
-        return False  # New accounts must be escalated
-    
-    return True
-```
-
-**Soft Oracle (Judge):**
-```python
-def helpfulness_oracle(response: str) -> float:
-    """Soft oracle: helpfulness score 0-1"""
-    rubric = """Score the response on:
-    1. Helpfulness (addresses user concern)
-    2. Empathy (acknowledges frustration)
-    3. Clarity (easy to understand)
-    
-    Return a score 0-1."""
-    
-    return llm_judge(response, rubric)
-```
-
-**Aggregation:**
-```python
-def dual_oracle_decision(response: str, context: Dict) -> Dict[str, Any]:
-    hard_pass = policy_oracle(response, context)
-    soft_score = helpfulness_oracle(response)
-    
-    if not hard_pass:
-        return {"decision": "BLOCK", "reason": "Policy violation"}
-    
-    if soft_score < 0.9:
-        return {"decision": "WARN", "reason": f"Low helpfulness: {soft_score:.2f}"}
-    
-    return {"decision": "PASS"}
-```
-
-**Metrics:**
-- Hard oracle pass rate: 100% (required)
-- Soft oracle avg score: >=0.9
-- False positive rate (hard oracle): <1% (manual review monthly)
-
-### Scenario D: RAG Faithfulness CI + Citation Eval
-
-**Context:**
-- Legal research assistant (RAG over case law)
-- Every answer must cite sources
-- CI must catch hallucinations before deploy
-- SLA: 100% citation correctness
-
-**Design:**
-
-```
-┌──────────────────┐
-│  Pull Request    │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│  CI Trigger      │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│  Eval Suite      │  100 legal questions (holdout)
-│  (RAGAS)         │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│  Agent Run       │  Generate answers + citations
-└────────┬─────────┘
-         │
-         ├─────────────────────────────────┐
-         │                                 │
-         ▼                                 ▼
-┌──────────────────┐             ┌──────────────────┐
-│  Faithfulness    │             │  Citation Check  │
-│  (RAGAS)         │             │  (Hard Oracle)   │
-│                  │             │                  │
-│  Claims grounded │             │  - Source exists │
-│  in context?     │             │  - Claim in src  │
-└────────┬─────────┘             └────────┬─────────┘
-         │                                 │
-         └──────────┬──────────────────────┘
-                    │
-                    ▼
-           ┌──────────────────┐
-           │  Aggregate       │  Faithfulness >=95%
-           │  Metrics         │  Citation >=100%
-           └────────┬─────────┘
-                    │
-                    ▼
-           ┌──────────────────┐
-           │  CI Gate         │  Pass → Merge
-           │                  │  Fail → Block
-           └──────────────────┘
-```
-
-**Citation Oracle:**
-```python
-def citation_oracle(answer: str, retrieved_docs: List[str]) -> float:
-    """
-    Check citation correctness.
-    
-    Returns:
-      1.0 if all citations are correct
-      0.0 if any citation is incorrect
-    """
-    citations = extract_citations(answer)  # e.g., [1], [2], [3]
-    
-    for citation_num in citations:
-        if citation_num > len(retrieved_docs):
-            return 0.0  # Citation out of range
-        
-        # Extract claim associated with citation
-        claim = extract_claim_for_citation(answer, citation_num)
-        
-        # Check if claim is in cited document
-        cited_doc = retrieved_docs[citation_num - 1]
-        if claim not in cited_doc:
-            return 0.0  # Claim not in source
-    
-    return 1.0  # All citations correct
-```
-
-**Metrics:**
-- Faithfulness (RAGAS): >=95%
-- Citation correctness: 100% (zero tolerance)
-- Coverage: >=90% of claims have citations
-
-**Cost:**
-```
-Per CI run:
-  100 test cases
-  Agent execution: $10 (cached prompts)
-  RAGAS faithfulness judge: 100 × $0.02 = $2
-  Citation oracle: Free (hard-coded check)
-  
-Total: $12/run
-
-Runs per day: ~10 PRs
-Monthly: $12 × 10 × 30 = $3,600
-```
-
-**Failure modes:**
-1. RAGAS judge hallucinates (says claim is grounded when it's not) → Solution: Human spot-check 10 failures/month
-2. Citation format changes (parser breaks) → Solution: Schema validation + unit tests
-3. Retrieved docs change between eval and production → Solution: Pin doc versions in test set
-
-## Interview Q&A
-
-### Q1: How would you design an eval system for a customer support chatbot?
-
-**Answer:**
-
-**Step 1: Define success metrics (layered)**
-- L1 (Task success): Did the agent resolve the issue? (binary)
-- L2 (Trajectory): Did it follow the right steps? (tool selection, escalation)
-- L3 (Quality): Was the response helpful, empathetic, clear? (LLM judge)
-- L4 (Constraints): Latency <5s, cost <$0.10/query
-
-**Step 2: Choose eval paradigm**
-- Pointwise: Judge each response independently (for quality)
-- Reference-based: Compare to expected resolution (for task success)
-- Pairwise: A/B test new prompt vs baseline
-
-**Step 3: Hard oracle + Soft oracle**
-- Hard: Did the agent use correct tools? (e.g., check_order_status, issue_refund)
-- Soft: LLM judge scores helpfulness, empathy (1-5 scale with rubric)
-
-**Step 4: Dataset**
-- Holdout test set: 200 conversations (manually labeled)
-- Stratify by issue type (refund, shipping, technical support)
-- Update quarterly from production samples (avoid staleness)
-
-**Step 5: CI Integration**
-- Pre-deployment: Run full suite (200 cases), require >=90% task success, >=4.0 avg quality
-- Post-deployment: Monitor 10% of production traffic, alert if metrics drop >5pp
-
-**Step 6: Cost control**
-- Use Sonnet 4.5 as judge (not Opus) to stay under 15% cost ratio
-- Sample 10% of production (not 100%)
-- Cache rubrics (save 50% on judge input tokens)
-
-**Step 7: Failure modes**
-- Judge bias: Audit for length, position bias monthly
-- Contamination: Rotate test set, never publish
-- Drift: Track judge consistency (run same trace 3x, check variance)
-
-**Trade-off:** Higher eval coverage (50%+) improves signal but costs more. Start at 10%, increase only if drift detection is noisy.
-
-### Q2: Explain pass@k vs pass^k. When would you use each?
-
-**Answer:**
-
-**pass@k (at least one success):**
-- Definition: Probability that at least one of k samples solves the task
-- Formula: `1 - C(n-c, k) / C(n, k)` where n=total samples, c=correct, k=target
-- Use case: Code generation where you can run multiple candidates and pick the best (e.g., GitHub Copilot suggests 3 completions)
-- Interpretation: "If I sample k times, what's the chance at least one is right?"
-
-**pass^k (all successes):**
-- Definition: Probability that all k samples solve the task
-- Formula: `C(c, k) / C(n, k)`
-- Use case: Reliability-critical applications (medical diagnosis, financial advice) where every invocation must succeed
-- Interpretation: "If I sample k times, what's the chance all k are right?"
-
-**Key difference:**
-- pass@k >= pass^k always (at-least-one >= all)
-- Gap shows variance: narrow gap = consistent agent, wide gap = unreliable
-
-**Example:**
-```
-n=10 samples, c=6 correct
-
-pass@3 = 1 - C(4,3)/C(10,3) = 1 - 4/120 = 0.967 (96.7%)
-pass^3 = C(6,3)/C(10,3) = 20/120 = 0.167 (16.7%)
-
-Gap: 80pp → High variance, agent is inconsistent
-```
-
-**When to use:**
-- pass@k: Benchmarking models (HumanEval, MBPP), selecting code suggestions
-- pass^k: SLA guarantees (tau-bench), production reliability targets
-
-**Interview follow-up:** "How many samples do you need to estimate pass@10 accurately?"
-- Answer: Draw n>=10 samples per task. For 100 tasks, that's 1000+ agent runs. Expensive but necessary for unbiased estimate.
-
-### Q3: What are the failure modes of LLM-as-judge? How do you mitigate?
-
-**Answer:**
-
-**Failure Mode 1: Position Bias**
-- Judge prefers first or last response in pairwise comparison
-- Zheng et al.: GPT-4 changed preference ~1/3 of cases when order swapped
-- Mitigation: Swap order, run twice, aggregate
-
-**Failure Mode 2: Length/Verbosity Bias**
-- Longer responses score higher regardless of quality
-- AlpacaEval: Optimized for verbosity, not helpfulness
-- Mitigation: Normalize by length, explicit rubric ("brevity is valued")
-
-**Failure Mode 3: Self-Preference Bias**
-- Model prefers its own outputs over competitors
-- Mitigation: Use different model as judge (GPT-4 judge for Claude output)
-
-**Failure Mode 4: Rubric Position Bias**
-- Judge scores first rubric criterion higher (2026 finding)
-- Mitigation: Randomize rubric order, aggregate across permutations
-
-**Failure Mode 5: Compounding Biases**
-- Multiple biases interact (FairJudge Feb 2026: >50% error rates)
-- Mitigation: Ensemble judges (3 models, majority vote)
-
-**Validation protocol (4 steps):**
-1. Inter-judge agreement: Run 2+ models, measure Cohen's kappa (target >=0.6)
-2. Human alignment: Sample 100 judgments, compare to human labels (target >=80% agreement)
-3. Bias audit: Swap orders, normalize lengths, cross-model judging
-4. Calibration: Anchor judge on 5-10 known-good/known-bad examples before eval
-
-**Production mitigation:**
-- Chain-of-thought: Force judge to explain reasoning first (improves agreement 0.55 → 0.75 kappa)
-- Consistency check: Run same trace 3x, alert if std dev >0.1
-- Human spot-check: Manually review 1% of judge outputs monthly
-
-**Cost:** Validation is expensive (3x judge calls for ensemble). Only do this for high-stakes evals (medical, legal, financial).
-
-### Q4: How do you prevent contamination in eval datasets?
-
-**Answer:**
-
-**Contamination:** Model has seen the test data during training → inflated scores.
-
-**Detection:**
-1. **Canary tokens:** Embed unique IDs in test data, search for them in model outputs
-2. **Time-based splits:** Test on data after model's cutoff date (GAIA 2: created after GPT-4 training)
-3. **Performance discontinuities:** If model scores 95% on public benchmark, 60% on holdout → contamination
-
-**Prevention:**
-
-| Control | Description | Example | Effectiveness |
-|---------|-------------|---------|---------------|
-| **Holdout sets** | Unpublished tests, rotated periodically | Gemini leaderboard (rotates monthly) | High (until leaked) |
-| **Canary tokens** | Unique IDs to detect leaks | SWE-bench ticket IDs | High (detects, doesn't prevent) |
-| **Time-based splits** | Test on post-cutoff data | GAIA 2 | Medium (models still learn patterns) |
-| **Dynamic generation** | Generate new tasks on-the-fly | MATH (infinite algebra problems) | High (hard to memorize) |
-| **Human verification** | Manual review of every pass | GAIA 2, SWE-bench Verified | Very high (expensive) |
-
-**SWE-bench case study:**
-- 19.78% of "passes" were semantically incorrect (hardcoded test outputs)
-- Solution: SWE-bench Verified (731 tasks, human-reviewed for semantic correctness)
-
-**Best practice:**
-- Public benchmark: Use for directional signal only, never for release decisions
-- Private holdout: Update quarterly from production samples, never publish
-- Rotation: Refresh 20% of test set every month (keeps test fresh)
-
-**Interview follow-up:** "How do you balance freshness vs stability of eval datasets?"
-- Answer: Keep 80% stable (track regression), rotate 20% (avoid staleness). Report both "stable score" and "fresh score."
-
-### Q5: What's your eval strategy for a RAG system?
-
-**Answer:**
-
-**Metrics (4 dimensions):**
-
-1. **Faithfulness (most critical)**
-   - Are claims in the answer grounded in retrieved context?
-   - RAGAS formula: (Claims supported) / (Total claims)
-   - Target: >=95%
-
-2. **Answer Relevance**
-   - Does the answer address the query?
-   - LLM judge: "Rate relevance 1-5"
-   - Target: >=4.0
-
-3. **Citation Correctness**
-   - Are citations accurate and verifiable?
-   - Hard oracle: Check if cited source exists and contains the claim
-   - Target: 100% (zero tolerance)
-
-4. **Retrieval Quality**
-   - Precision: How many retrieved docs are relevant?
-   - Recall: How many relevant docs were retrieved?
-   - Target: Precision >=80%, Recall >=90%
-
-**Eval pipeline:**
-
-```
-Query → Retriever → Top-5 docs → LLM → Answer + citations
-                ↓                         ↓
-         Retrieval eval          Faithfulness eval
-         (Precision/Recall)      (RAGAS + Citation oracle)
-```
-
-**Test set:**
-- 200 queries (manually labeled with expected answers + relevant docs)
-- Stratify by query type (factual, comparison, procedural)
-- Update quarterly from production logs
-
-**Hard oracle (Citation):**
-```python
-def citation_oracle(answer, retrieved_docs):
-    citations = extract_citations(answer)
-    for cite_num in citations:
-        claim = extract_claim_for_citation(answer, cite_num)
-        cited_doc = retrieved_docs[cite_num - 1]
-        if claim not in cited_doc:
-            return False  # Citation incorrect
-    return True
-```
-
-**Soft oracle (Faithfulness):**
-- Use RAGAS (LLM judge extracts claims, checks grounding)
-- ~95% human agreement (validated)
-
-**Cost control:**
-- Use Haiku for faithfulness judge (cheap)
-- Sample 10% of production traffic
-- Cache retrieval results (avoid re-fetching same docs)
-
-**Failure modes:**
-1. Retriever returns irrelevant docs → Faithfulness score high (no false claims) but answer is vague → Solution: Track answer relevance separately
-2. Judge hallucinates (says claim is grounded when it's not) → Solution: Human spot-check 10 failures/month
-3. Retrieved docs change (KB updated) → Solution: Version KB snapshots, re-run eval on old snapshot to catch regressions
-
-### Q6: How do you evaluate agent trajectory quality (not just end-to-end success)?
-
-**Answer:**
-
-**Why trajectory matters:**
-- End-to-end success doesn't explain why the agent succeeded/failed
-- Trajectory quality predicts debugging effort (bad trajectory = hard to fix)
-
-**Evaluation layers:**
-
-**Layer 1: Tool Selection**
-- Metric: Accuracy = (Correct tools) / (Total tools called)
-- Target: >=95%
-- Example failure: Agent calls `search_web` when `read_file` was correct
-
-**Layer 2: Argument Correctness**
-- Metric: (Correct args) / (Total args)
-- Target: >=90%
-- Example failure: `read_file(path="wrong.txt")` instead of `read_file(path="correct.txt")`
-
-**Layer 3: Efficiency**
-- Metric: (Minimum tool calls to solve) / (Actual tool calls)
-- Target: >=0.8 (no more than 25% overhead)
-- Example failure: Agent calls `search` 10 times when 2 would suffice
-
-**Layer 4: Error Recovery**
-- Metric: (Successful retries) / (Total errors)
-- Target: >=70%
-- Example failure: Agent gets API error, gives up instead of retrying
-
-**Layer 5: Repetition**
-- Metric: (Duplicate tool calls) / (Total tool calls)
-- Target: <5%
-- Example failure: Agent calls same API 3 times with identical params (loop)
-
-**Aggregation: Geometric Mean**
-```python
-def score_trajectory(steps):
-    step_scores = [score_step(s) for s in steps]
-    # Geometric mean: (s1 * s2 * ... * sn)^(1/n)
-    return np.prod(step_scores) ** (1 / len(step_scores))
-```
-
-Why geometric vs arithmetic? Geometric penalizes any single bad step more (reflects reality: one mistake can derail entire task).
-
-**Grading modes:**
-
-| Mode | Description | Use Case |
-|------|-------------|----------|
-| **Exact matching** | Trajectory must match gold exactly (order + args) | High-fidelity reproduction (SWE-bench) |
-| **Set-based** | Tool calls match as set (order doesn't matter) | Tasks with no canonical order |
-| **Partial credit** | Score = overlap / expected | Debugging, explainability |
-| **LLM judge** | Judge scores trajectory on rubric | Open-ended tasks |
-
-**Example (SWE-bench):**
-```
-Expected: [read_file("bug.py"), edit_file("bug.py", fix), run_tests()]
-Agent:    [search_files("bug"), read_file("bug.py"), edit_file("bug.py", fix), run_tests()]
-
-Exact match: Fail (extra search step)
-Set-based: Pass (all required tools called)
-Partial credit: 3/3 = 100% (all required steps present)
-```
-
-**Trade-off:** Exact matching is strict but clear. Set-based is lenient but may miss order-dependent bugs.
-
-### Q7: How do you handle the cost of evaluation at scale?
-
-**Answer:**
-
-**Problem:** Evaluating 100% of production traffic with LLM-as-judge can cost more than production itself.
-
-**Guardrail: Judge cost should be <15% of production LLM cost.**
-
-**Strategies:**
-
-**1. Sampling (50-90% cost reduction)**
-- Evaluate 10% of traffic, not 100%
-- Use reservoir sampling to maintain random sample
-- Trade-off: Higher variance (need more samples to detect drift)
-
-**2. Cheap judge first, escalate (60-80% cost reduction)**
-- Use Haiku/Sonnet for first-pass, Opus only for edge cases
-- Example: Haiku judges all, if score <0.5, escalate to Opus
-- Trade-off: May miss subtle quality gaps
-
-**3. Hard oracle preference (80-95% cost reduction)**
-- If exact match passes, skip judge
-- Only invoke judge on failures (for debugging)
-- Trade-off: Only works when ground truth exists
-
-**4. Prompt caching (40-60% cost reduction)**
-- Cache rubric + few-shot examples (repeated across evals)
-- Anthropic prompt caching: 90% discount on cached tokens
-- Trade-off: Only helps if rubric is reused (not task-specific prompts)
-
-**5. Batching (10-20% cost reduction)**
-- Batch 100+ requests to amortize API overhead
-- Trade-off: Higher latency, infra complexity
-
-**Example (RAG eval with cost optimization):**
-
-```
-Baseline:
-  10k queries/day, 100% eval coverage
-  Judge: Opus 5 ($15/MTok input, $75/MTok output)
-  Avg 3000 input tokens, 200 output tokens
-  Cost: (10k × 3000 × $15/MTok) + (10k × 200 × $75/MTok) = $450 + $150 = $600/day
-
-Optimized:
-  1. Sample 10% → 1k queries/day → $60/day
-  2. Use Sonnet 4.5 judge ($3/MTok input, $15/MTok output) → $6 + $3 = $9/day
-  3. Cache rubric (500 tokens, 90% discount) → Save $0.50/day
-  
-Final: $8.50/day (98.6% cost reduction)
-```
-
-**Capacity planning:**
-- Production rate: 1000 req/s
-- Eval sample rate: 10% → 100 req/s to eval
-- Per-eval latency: 1s (judge call)
-- Workers needed: 100 (1 req/s each)
-- Cost: 100 workers × $0.01/hour = $1/hour = $720/month infra
-
-**When to increase eval coverage:**
-- High-stakes domain (medical, legal, financial) → 50-100%
-- Mature system with low drift → 1-5%
-- New deployment (first month) → 50% (validate assumptions)
-
-### Q8: Explain the three-layer eval stack (end-to-end, trajectory, component).
-
-**Answer:**
-
-**Analogy:** Debugging a failing test
-- L1 (End-to-end): Test failed (binary signal)
-- L2 (Trajectory): Which step failed? (localize bug)
-- L3 (Component): Why did that step fail? (root cause)
-
-**Layer 1: End-to-End (Task Success)**
-- Question: Did the agent accomplish the goal?
-- Metric: pass@k, pass^k, exact match
-- Example: SWE-bench (did it resolve the GitHub issue?), GAIA (correct answer?)
-- Use: Release gate (deploy only if >=90% task success)
-
-**Layer 2: Trajectory Quality**
-- Question: How did the agent get to the answer?
-- Metrics: Tool selection accuracy, argument correctness, efficiency
-- Example: Agent solved the task but took 20 steps instead of 5
-- Use: Debugging (why is latency high?), optimization (prune unnecessary steps)
-
-**Layer 3: Component-Level**
-- Question: Are individual scaffold pieces working correctly?
-- Metrics: Tool selection in isolation, argument generation, error recovery
-- Example: Test "given state S, does agent choose correct tool?" without running full task
-- Use: Unit tests (catch regressions in tool selection logic before integration)
-
-**How they relate:**
-```
-L1 (Task success) = f(L2 trajectory quality)
-L2 (Trajectory quality) = g(L3 component correctness)
-
-If L1 fails → Check L2 to localize failure
-If L2 fails → Check L3 to find root cause
-```
-
-**Example (Customer support agent):**
-
-```
-L1: Did agent resolve the issue?
-  → No (end-to-end failure)
-
-L2: Trajectory analysis
-  Step 1: check_order_status(order_id="12345") → Success
-  Step 2: issue_refund(order_id="12345", amount=100) → Error ("amount exceeds order total")
-  Step 3: Agent stops (no retry)
-  → Failure at Step 2 (incorrect refund amount)
-
-L3: Component analysis
-  Test: "Given order total $50, what refund amount should agent propose?"
-  Expected: $50 (full refund)
-  Agent: $100 (incorrect)
-  → Root cause: Agent hallucinates refund amount, doesn't read order total from context
-```
-
-**Trade-off:**
-- L1 is cheap to measure (one boolean), but gives no debugging signal
-- L3 is expensive to measure (need labeled data for each component), but gives precise root cause
-- L2 is the sweet spot: moderate cost, actionable debugging signal
-
-### Q9: How do you set up CI for agent evaluation?
-
-**Answer:**
-
-**Goal:** Block deploy if eval suite fails (regression protection).
-
-**CI Pipeline:**
-
-```
-┌──────────────┐
-│ Pull Request │
-└──────┬───────┘
-       │
-       ▼
-┌──────────────┐
-│ Lint + Unit  │  Fast checks (10s)
-│ Tests        │
-└──────┬───────┘
-       │
-       ▼
-┌──────────────┐
-│ Eval Suite   │  Agent eval (5-30 min)
-│ (100 tasks)  │
-└──────┬───────┘
-       │
-       ├─────────────────┬─────────────────┐
-       │                 │                 │
-       ▼                 ▼                 ▼
-┌──────────┐    ┌──────────────┐   ┌──────────────┐
-│ Task     │    │ Trajectory   │   │ Cost + Latency│
-│ Success  │    │ Quality      │   │ Check         │
-└──────┬───┘    └──────┬───────┘   └──────┬───────┘
-       │               │                   │
-       └───────┬───────┴───────────────────┘
-               │
-               ▼
-      ┌──────────────┐
-      │ Release Gate │  Pass thresholds?
-      └──────┬───────┘
-             │
-             ├─────────────┬──────────────┐
-             │             │              │
-             ▼             ▼              ▼
-        ┌────────┐   ┌─────────┐   ┌──────────┐
-        │ Pass   │   │ Warn    │   │ Fail     │
-        │ (merge)│   │ (review)│   │ (block)  │
-        └────────┘   └─────────┘   └──────────┘
-```
-
-**Thresholds:**
-
-| Metric | Pass | Warn | Fail |
-|--------|------|------|------|
-| **Task success (pass@1)** | >=90% | 85-90% | <85% |
-| **Trajectory score** | >=0.85 | 0.75-0.85 | <0.75 |
-| **Cost per task** | <=$0.10 | $0.10-$0.15 | >$0.15 |
-| **p95 latency** | <=5s | 5-10s | >10s |
-
-**Handling flakiness:**
-- Non-deterministic agents cause CI flakiness (pass locally, fail in CI)
-- Solution: pass@3 metric (if any of 3 runs passes, test passes)
-- Trade-off: Slower CI (3x execution time), but tolerates variance
-
-**Checkpointing:**
-- Long eval suites (SWE-bench: 10 hours) risk losing progress on crash
-- Save checkpoint every 10 tasks, resume on failure
-
-**Caching:**
-- Cache LLM responses by (prompt, model, temperature) to avoid redundant API calls
-- Invalidate cache on model/prompt change
-
-**Cost control:**
-- Limit eval suite to 100 tasks (not 2,294 full SWE-bench)
-- Use cheaper model (Sonnet instead of Opus) for CI
-- Full eval suite runs nightly (not on every PR)
-
-**Example (.github/workflows/eval.yml):**
-
-```yaml
-name: Agent Eval CI
-
-on:
-  pull_request:
-    branches: [main]
-
-jobs:
-  eval:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    
-    steps:
-      - uses: actions/checkout@v3
-      
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-      
-      - name: Run eval suite
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: |
-          python eval_suite.py \
-            --num-tasks 100 \
-            --model claude-sonnet-4.5 \
-            --pass-at-k 3 \
-            --checkpoint eval_checkpoint.json
-      
-      - name: Check thresholds
-        run: |
-          python check_thresholds.py \
-            --task-success-min 0.90 \
-            --trajectory-score-min 0.85 \
-            --cost-max 0.10 \
-            --latency-p95-max 5000
-      
-      - name: Upload results
-        uses: actions/upload-artifact@v3
-        with:
-          name: eval-results
-          path: eval_results.json
-```
-
-**Failure modes:**
-1. CI is too slow (30+ min) → Developers bypass it → Solution: Reduce test set to 50 tasks, run full suite nightly
-2. Flakiness causes false failures → Developers ignore CI → Solution: pass@3, temperature=0
-3. Cost blows up ($100/PR) → Finance complains → Solution: Use Sonnet, cache aggressively
-
-### Q10: What's the difference between online eval and offline eval?
-
-**Answer:**
-
-| Dimension | Offline Eval | Online Eval |
-|-----------|--------------|-------------|
-| **When** | Pre-deployment (CI, nightly) | Post-deployment (production) |
-| **Data** | Holdout test set (labeled) | Live production traffic (unlabeled) |
-| **Coverage** | 100% of test set | 1-10% of production (sampled) |
-| **Latency** | No user impact (async) | Must not slow user response |
-| **Cost** | Fixed (test set size) | Scales with traffic |
-| **Goal** | Release gate (block bad deploys) | Regression detection (catch drift) |
-| **Metrics** | Task success, trajectory quality | Drift, anomaly detection |
-
-**Offline eval:**
-- Run in CI before deploy
-- Test set: 100-1000 labeled examples
-- Hard oracle (exact match) + soft oracle (judge)
-- Threshold: >=90% task success → deploy
-- Example: SWE-bench, GAIA, HumanEval
-
-**Online eval:**
-- Run continuously in production
-- Sample 10% of traffic (reservoir sampling)
-- Compare current window vs baseline (drift detection)
-- Alert if metrics drop >5pp
-- Example: LangSmith, Braintrust, Phoenix
-
-**Why both?**
-- Offline catches known regressions (test set)
-- Online catches unknown issues (edge cases not in test set)
-
-**Example workflow:**
-
-```
-┌─────────────────┐
-│ Offline Eval    │  (CI)
-│ pass@1 = 92%    │  → Pass → Deploy
-└─────────┬───────┘
-          │
-          ▼
-┌─────────────────┐
-│ Production      │
-│ (live traffic)  │
-└─────────┬───────┘
-          │
-          ▼
-┌─────────────────┐
-│ Online Eval     │  (10% sample)
-│ pass@1 = 85%    │  → Alert (7pp drop)
-└─────────┬───────┘
-          │
-          ▼
-┌─────────────────┐
-│ Investigation   │  What changed?
-│ - New user types?
-│ - API change?
-│ - Model drift?
-└─────────────────┘
-```
-
-**Hybrid approach (best practice):**
-- Offline: 100 high-quality labeled examples (curated)
-- Online: 1000s of production samples (diverse but unlabeled)
-- Human-in-loop: Label 1% of online failures, add to offline test set (closes the loop)
-
-**Cost:**
-```
-Offline:
-  100 tasks × $0.10/task = $10/run
-  Runs: 10 PRs/day × 30 days = 300 runs/month
-  Cost: $3,000/month
-
-Online:
-  10k production queries/day × 10% sample = 1k/day
-  1k × $0.02/eval = $20/day
-  Cost: $600/month
-
-Total: $3,600/month
-```
-
-**Interview follow-up:** "How do you handle unlabeled data in online eval?"
-- Answer: Use weak labels (heuristics, user feedback, implicit signals like retry rate) or human-in-loop labeling (sample 1% for manual review).
-
-### Q11: How do you validate an LLM judge before deploying it?
-
-**Answer:**
-
-**Validation protocol (5 steps):**
-
-**1. Inter-judge agreement**
-- Run 2-3 different models as judges on same 100-sample dataset
-- Measure Cohen's kappa (inter-rater agreement)
-- Target: kappa >=0.6 (substantial agreement)
-- If kappa <0.4, judges are unreliable → Don't deploy
-
-**2. Human alignment**
-- Sample 100-200 judgments, have 3 humans independently label
-- Measure judge-human agreement
-- Target: >=80% agreement with human majority vote
-- RAGAS faithfulness: ~95% human agreement (gold standard)
-
-**3. Bias audit**
-- Position bias: Swap A/B order in pairwise comparison, check if preference flips
-- Length bias: Compare judgments on (long, good) vs (short, good) responses
-- Self-preference bias: Use GPT-4 judge on Claude output, check if biased toward GPT-4 outputs
-
-**4. Calibration**
-- Show judge 5-10 anchor examples before eval (score-1 through score-5 examples)
-- Check if judge maintains calibration across eval (scores stay consistent)
-
-**5. Consistency check**
-- Run same trace through judge 3 times (with temperature=0)
-- Measure std dev of scores
-- Target: std dev <0.1 (judge is consistent)
-
-**Example validation dataset:**
-
-```python
-validation_set = [
-    {
-        "output": "Paris is the capital of France.",
-        "expected_score": 5,  # Perfect answer
-        "category": "factual"
-    },
-    {
-        "output": "Paris is a city.",
-        "expected_score": 3,  # Correct but vague
-        "category": "factual"
-    },
-    {
-        "output": "London is the capital of France.",
-        "expected_score": 1,  # Factually wrong
-        "category": "factual"
-    },
-    # ... 100 examples across categories
-]
-
-# Run judge on validation set
-for example in validation_set:
-    judge_score = judge(example["output"], rubric)
-    human_score = example["expected_score"]
-    
-    agreement = abs(judge_score - human_score) <= 1  # Allow 1-point tolerance
-    # Aggregate: what % of examples have judge-human agreement?
-```
-
-**Failure criteria (don't deploy if):**
-- Judge-human agreement <70%
-- Inter-judge kappa <0.4
-- Bias audit shows >20% preference flip on order swap
-- Consistency check shows std dev >0.2
-
-**Monitoring (post-deployment):**
-- Re-validate monthly (models get updated, behavior drifts)
-- Human spot-check 1% of judge outputs (catch silent failures)
-- Track judge cost ratio (should stay <15% of production cost)
-
-**Trade-off:** Validation is expensive (human labeling, multiple judge runs). Only do full validation for high-stakes domains (medical, legal, financial).
-
-### Q12: How would you debug a failing eval suite (offline eval passes, online eval fails)?
-
-**Answer:**
-
-**Symptom:** Offline eval shows 95% pass rate, but online eval shows 85% → 10pp gap.
-
-**Hypothesis tree:**
-
-**1. Test set is not representative**
-- Offline test set is too easy or doesn't cover production edge cases
-- Check: Analyze online failures, look for patterns (new query types, edge cases)
-- Fix: Add failing production samples to offline test set (close the loop)
-
-**2. Data distribution shift**
-- Production traffic changed (new user types, new use cases)
-- Check: Compare offline test set distribution vs online traffic (query length, topic)
-- Fix: Stratify test set by query type, ensure coverage
-
-**3. Infrastructure differences**
-- Offline runs in controlled environment (mocked APIs, fixed DB state)
-- Online hits real APIs (rate limits, timeouts, stale data)
-- Check: Compare tool failure rates (offline vs online)
-- Fix: Add API retry logic, test with live APIs in staging
-
-**4. Non-determinism**
-- Agent is non-deterministic (temperature >0, tool execution variance)
-- Offline eval runs once per task, online runs many times (variance shows up)
-- Check: Run offline eval with pass@10, see if gap narrows
-- Fix: Report pass@3 instead of pass@1 (tolerate variance)
-
-**5. Measurement error**
-- Online eval uses weak labels (heuristics, not ground truth)
-- Offline uses gold labels (manually verified)
-- Check: Sample 100 online "failures", manually verify (are they real failures?)
-- Fix: Improve weak label quality (better heuristics, human-in-loop)
-
-**6. Contamination**
-- Offline test set leaked into training data → inflated offline scores
-- Online sees novel data → true performance lower
-- Check: Test on fresh holdout set (created after model training)
-- Fix: Rotate test set quarterly, never publish
-
-**Debugging workflow:**
-
-```
-Step 1: Sample 100 online failures
-Step 2: Manually label (are they real failures? or labeling errors?)
-Step 3: If real failures:
-  → Add to offline test set
-  → Re-run offline eval (should now fail, reproducing online issue)
-Step 4: If not real failures:
-  → Fix online labeling heuristic
-  → Re-run online eval (failure rate should drop)
-```
-
-**Example (RAG system):**
-
-```
-Offline: 95% faithfulness (RAGAS judge on 100 labeled examples)
-Online: 85% faithfulness (heuristic: check if answer contains "I don't know")
-
-Investigation:
-  - Sample 50 online "failures"
-  - Manual review: 30 are real failures (hallucinations), 20 are false positives (correct refusals labeled as failures)
-  
-Root cause: Online heuristic counts refusals as failures
-
-Fix:
-  - Update heuristic: Only flag as failure if answer makes a claim (not refusal)
-  - Re-run: Online faithfulness now 91% (closer to offline)
-```
-
-**Prevention:**
-- Continuously add online failures to offline test set (closes the loop)
-- Run offline eval on production-sampled data monthly (catch distribution shift early)
-- Monitor offline/online gap as a metric (alert if >5pp)
-
-## Key Numbers to Memorize
-
-### Benchmark Anchors
-
-| Benchmark | Size | Human Performance | GPT-4 Performance | Notes |
-|-----------|------|-------------------|-------------------|-------|
-| **SWE-bench** | 2,294 | ~90% (dev) | ~25% (2025) | Real GitHub issues, hard |
-| **SWE-bench Lite** | 500 | ~90% | ~30% | Easier subset |
-| **SWE-bench Verified** | 731 | ~90% | ~35% | Manually verified semantic correctness |
-| **GAIA** | 466 | 92% | 15% (GPT-4+plugins) | Multi-step, real-world tasks |
-| **GAIA 2** | 690 | 92% | ~25% (est) | Contamination-resistant version |
-| **HumanEval** | 164 | ~97% | 67% (GPT-4) | Code generation, unit tests |
-| **HumanEval+** | 164 (80x tests) | ~97% | 48% (GPT-4) | Scaled test coverage → 19pp drop |
-| **MATH** | 12,500 | ~90% (AMC level) | 42% (GPT-4) | Competition math problems |
-| **HealthBench** | 5,000 | ~85% (clinicians) | ~70% (GPT-4) | Medical conversations, 48,562 criteria |
-
-### Pass@k Inflation
-
-| Study | Baseline (pass@1) | Intervention | New (pass@1) | Lift |
-|-------|-------------------|--------------|--------------|------|
-| **Anthropic tau-airline** | 33.2% | Extended thinking (Think tool) | 58.4% | +25.2pp |
-| **HumanEval → HumanEval+** | 67% (GPT-4) | 80x test coverage | 48% | -19pp |
-| **On Randomness** | Varies | Temperature 0 (repeat runs) | SD >1.5pp | High variance even at T=0 |
-
-### LLM Judge Reliability
-
-| Metric | Target | Best-in-Class | Notes |
-|--------|--------|---------------|-------|
-| **Human agreement** | >=80% | ~95% (RAGAS faithfulness) | Measure on 100+ samples |
-| **Inter-judge kappa** | >=0.6 | ~0.75 (with CoT) | Cohen's kappa between judges |
-| **Position bias** | <10% flip rate | ~33% (GPT-4, Zheng) | Swap A/B order, check preference change |
-| **Consistency (std dev)** | <0.1 | Varies by model | Run same input 3x, measure variance |
-
-### Cost Ratios
-
-| Ratio | Target | Typical (Unoptimized) | Notes |
-|-------|--------|----------------------|-------|
-| **Judge cost / Production cost** | <15% | 50-400% | Use cheaper judge, sampling, caching |
-| **Eval infra / LLM cost** | <10% | 5-20% | Workers, storage, platform fees |
-
-## Common Failure Modes
-
-| Failure Mode | Symptom | Root Cause | Mitigation |
-|--------------|---------|------------|------------|
-| **Offline/Online gap** | Offline 95%, Online 85% | Test set not representative | Add production samples to test set |
-| **Flaky CI** | Eval passes locally, fails in CI | Non-determinism (temperature, tools) | Use pass@3, temperature=0 |
-| **Judge hallucination** | Judge says answer is correct when it's wrong | LLM judge errors | Spot-check 1% monthly, ensemble judges |
-| **Position bias** | Judge preference flips on order swap | LLM judge bias | Swap order, aggregate |
-| **Length bias** | Longer responses score higher | LLM judge bias | Normalize by length, explicit rubric |
-| **Contamination** | Offline scores inflate over time | Test set leaked into training | Rotate test set quarterly, holdout unpublished |
-| **Lucky passes** | Agent succeeds for wrong reason | Task is under-specified or has multiple solutions | AgentLens analysis, run pass@k |
-| **Eval cost explosion** | Judge costs >100% of production | 100% coverage + expensive judge | Sample 10%, use cheap judge |
-| **Drift false positives** | Alerts fire but no real issue | High variance in online eval | Require 2 consecutive windows, larger sample size |
-| **Citation hallucination** | Agent cites non-existent sources | RAG system doesn't validate citations | Hard oracle: check source exists in retrieved docs |
-| **Test set staleness** | Offline scores stay high, online drops | Distribution shift (production evolved) | Refresh test set quarterly from production |
-| **Judge inconsistency** | Same input scored differently on retries | High temperature, non-deterministic judge | Temperature=0, consistency checks |
-| **Semantic incorrectness** | Passes unit tests but wrong logic | Tests don't cover edge cases (SWE-bench 19.78%) | HumanEval+ pattern (scale tests 80x) |
-| **Retry inflation** | pass@1 overstates due to retries | Agent retries failed tasks | Report "pass@1 (no retry)" separately |
-| **Judge cost loop** | Judge needs full trajectory → tokens exceed production | Long agent trajectories | Summarize trajectory, component-level grading |
+Quality regressions hit 40% of LLM deployments within 90 days. Without systematic evaluation, you discover failures from customer complaints, not dashboards. Evaluation is the mechanism that transforms an AI demo into a production system.
 
 ---
 
-**End of LLM & Agent Evaluation**
+## Part 1: System Topology and Data Flow
 
-This consolidated document merges all unique content from GPT, Opus, and Grok sources. All metrics, formulas, code samples, architecture diagrams, benchmarks, cost analyses, trade-offs, and interview Q&A are preserved in full detail.
+### Three-Plane Architecture
 
+An evaluation system has three planes operating on two different clocks:
+
+```
+                          EVAL CLOCK (batch, async)                 USER CLOCK (real-time)
+                ┌──────────────────────────────────┐      ┌──────────────────────────────────┐
+                │         CONTROL PLANE             │      │          DATA PLANE               │
+                │                                   │      │                                   │
+                │  Dataset (as_of pin)              │      │  Production agent (same scaffold  │
+                │  Runner  (k trials, env reset)    │      │    as CI, sim MCP only in eval)   │
+                │  Scorer  (hard + soft oracles)    │      │  Tracer (OTLP spans on every req) │
+                │  Gate    (pass^k, coverage%)      │      │  Sidecar judge (async, sampled)   │
+                │  Stats   (paired vs baseline,     │      │                                   │
+                │           bootstrap if n<200)     │      │  0 ms eval tax on user path       │
+                └───────────────┬──────────────────┘      └──────────────┬───────────────────┘
+                                │                                        │
+                                └──────────────┬─────────────────────────┘
+                                               v
+                              ┌──────────────────────────────────┐
+                              │        PERSISTENCE LAYER          │
+                              │                                   │
+                              │  Experiment store (run config,    │
+                              │    model, prompt hash, per-row)   │
+                              │  Dataset store (git-versioned,    │
+                              │    content-addressable)           │
+                              │  Audit log (immutable, tamper-    │
+                              │    evident, exportable to SIEM)   │
+                              └──────────────────────────────────┘
+```
+
+**Why three planes?** The control plane runs the eval harness on the eval clock (batch, nightly, or per-PR). The data plane serves real users on the user clock (real-time). A judge sidecar scores sampled production traces asynchronously -- it must never sit on the user request path. This separation is the single most important architectural decision: user-path eval tax must be **0 ms**.
+
+### Evaluated System = Product Tuple
+
+A score is meaningless without its full context. The evaluated system is not "the model." It is:
+
+**Model x Scaffold x Tools x Environment x Judge x Sampling x Retries x Infra**
+
+If any term changes, the score changes. Anthropic showed that infra alone (Docker image, RAM, network) accounts for **6 pp** on Terminal-Bench. SWE-agent's ACI shell interface vs raw bash on the same GPT-4 Turbo moved scores **+64% relative** (12.47% absolute, 286/2,294 instances). A `run_key` must therefore include `(suite_id, dataset_version, harness_commit, judge_model, trial_id)` -- a scaffold change is a new measurement.
+
+### Request-Flow Narrative
+
+1. **Dataset loads**: Golden set pinned by `as_of` content hash. Every discovered production bug auto-promotes into the regression suite after PII redaction.
+2. **Runner dispatches**: k independent trials per task, each with a fresh environment snapshot (Docker/DB reset). Concurrency limits and exponential backoff prevent judge rate-limit cascading.
+3. **Hard oracle fires first**: Deterministic checks -- DB goal-state assertions, policy-cap compliance, JSON schema validation, hidden unit tests. Milliseconds, zero ambiguity. If hard oracle fails, soft oracle is skipped (never averaged).
+4. **Soft oracle fires second**: LLM-as-judge rubric scores tone, completeness, and helpfulness on outputs that survived hard checks. Runs asynchronously. In online mode, a tripped judge breaker skips the score rather than failing the user's request.
+5. **Aggregator persists**: Full experiment config, per-row results, aggregate scores, `grader_status` (scored/skipped/error/timeout). Unscored rows are never counted as passed.
+6. **Gate decides**: `pass^k` on hard oracle, soft threshold with coverage floor, paired comparison vs last shipped version. A 50-item golden set cannot support a 3 pp claim (Miller worked example: n ~ 969 for 3 pp MDE).
+7. **Feedback loop closes**: Failing online traces flow to an annotation queue (redacted), get labeled, and join the regression dataset.
+
+### Three Evaluation Paradigms
+
+| Paradigm | Mechanism | Strength | Weakness | Best For |
+|---|---|---|---|---|
+| **Pointwise** | Absolute score (1-5) against rubric | Simple, threshold-ready | Susceptible to prompt variation, randomness | Quality gates, production monitoring |
+| **Pairwise** | Judge picks better of two responses | More stable (relative easier than absolute) | 2x inference cost (both orderings required), no absolute threshold | A/B testing model versions, prompt variants |
+| **Reference-Based** | Compare against gold-standard answer | Most objective | Requires curated reference datasets | Factual accuracy, structured extraction |
+
+**Real-world example**: When comparing two prompt variants for a customer support bot, use pairwise (evaluate both orderings, count only consistent verdicts). When gating a PR merge, use pointwise against your rubric with a threshold (e.g., avg >= 0.85). When checking RAG faithfulness against retrieved documents, use reference-based (RAGAS entailment).
+
+---
+
+## Part 2: Core Mechanics and Algorithms
+
+### pass@k -- Capability Envelope
+
+**What it measures**: The probability that at least one of k independent samples passes. It answers "can the system do this at all?"
+
+**Unbiased estimator** (Chen et al., HumanEval):
+
+```
+pass@k = 1 - C(n-c, k) / C(n, k)
+```
+
+Where n = total samples generated, c = number that passed, C = binomial coefficient.
+
+**Why not the naive formula?** The naive `1 - (1 - c/n)^k` is biased upward for small n. The Chen product uses combinatorial exact counting. **Critical edge case**: When n < k, the estimator is undefined. The UK AI Safety Institute's Inspect framework correctly returns NaN rather than extrapolating -- this is the right behavior, not a bug.
+
+**Real-world example**: You generate n=10 solutions for a coding problem and c=4 pass the unit tests. pass@1 = 1 - C(6,1)/C(10,1) = 0.4. pass@5 = 1 - C(6,5)/C(10,5) = 1 - 6/252 = 0.976. The system almost certainly *can* solve it if you sample enough -- but can it solve it reliably?
+
+### pass^k -- Reliability Metric
+
+**What it measures**: The probability that ALL k independent trials succeed. This is what users experience -- they get one try.
+
+**Estimator** (Inspect, without replacement):
+
+```
+pass^k = C(c, k) / C(n, k)
+```
+
+**Why this matters more than pass@k for production**: Users live on pass^1. The gap between pass@k and pass^k can be enormous:
+
+| Benchmark | pass@1 | pass^5 | Gap |
+|---|---|---|---|
+| tau-airline (GPT-4o class, baseline) | 0.332 | 0.100 | 23.2 pp |
+| tau-airline (think+prompt) | 0.584 | 0.340 | 24.4 pp |
+| tau-retail (Think) | 0.812 | 0.626 | 18.6 pp |
+| Original tau-retail pass^8 | -- | <25% | -- |
+| Randomness study max gap | -- | -- | **24.9 pp** |
+
+**Key insight**: pass@k requires a verifier (unit tests, DB state check) to pick the correct sample. If you only have an LLM judge, you cannot reliably select which of k samples is correct -- the judge is not a verifier. Gate on pass^k and report pass@k as the capability envelope.
+
+### Temperature 0 Does Not Mean Deterministic
+
+The Randomness paper analyzed ~60,000 trajectories: standard deviation still exceeds **1.5 pp at T=0**; single-run pass@1 ranges **2.2-6.0 pp**; trajectories diverge in the first ~1% of tokens due to aleatoric noise plus engine/environment nondeterminism. Treat a 31% to 33% single-run "win" as noise, not a result. Estimate pass@1 from multiple independent runs and report confidence intervals.
+
+### Dual-Oracle Pattern
+
+The enterprise default for any agent that touches money, policy, or safety:
+
+```
+┌─────────────┐     ┌──────────────────────────────────────┐
+│ Task Output  │────>│ Hard Oracle (deterministic)           │
+│              │     │  - DB goal-state assertions           │
+│              │     │  - Policy cap compliance              │
+│              │     │  - JSON/AST schema validation         │
+│              │     │  - Hidden unit tests                  │
+│              │     │  - Citation ID in retrieved set       │
+│              │     │                                       │
+│              │     │  Verdict: PASS / FAIL / ERROR         │
+│              │     └──────────────┬───────────────────────┘
+│              │                    │
+│              │          hard_fail ──> skip soft, never average
+│              │          hard_pass ──> proceed to soft
+│              │                    │
+│              │     ┌──────────────v───────────────────────┐
+│              │────>│ Soft Oracle (LLM judge, async)        │
+│              │     │  - Rubric: tone, completeness, PII    │
+│              │     │  - Position-swapped, CoT rationale    │
+│              │     │  - Breaker: skip online, error in CI  │
+│              │     │  - Score: 0.0-1.0 continuous           │
+│              │     └──────────────┬───────────────────────┘
+│              │                    │
+│              │     ┌──────────────v───────────────────────┐
+│              │     │ Gate Decision                         │
+│              │     │  hard.passed AND soft.score >= 0.85   │
+│              │     │  AND coverage >= 0.95                 │
+│              │     │  Result: SHIP / HOLD / INSPECT        │
+│              │     └──────────────────────────────────────┘
+└─────────────┘
+```
+
+**Why dual-oracle?** Hard-only ships "correct but hostile" and misses PII-in-logs. Soft-only ships "pretty wrong" (ARE whole-trace judge precision is only **0.53**). Safety is never in the mean -- a 0.70 safety score hidden inside "quality 0.93" is a lawsuit.
+
+**Real-world example**: A refund agent correctly processes a refund (hard oracle passes) but tells the customer "I processed your stupid refund, stop bothering us" (soft oracle catches the hostile tone). Hard-only would ship this. Conversely, an agent says "I've processed your refund!" warmly but actually booked the wrong fare class (soft oracle passes, hard oracle catches the DB state mismatch). Soft-only would ship this.
+
+### Six Evaluation Dimensions
+
+Every agent eval should measure across these six axes. Collapsing them into a single number hides failures:
+
+| Dimension | What It Measures | Hard or Soft | Example Check |
+|---|---|---|---|
+| **Task Success** | Did the agent achieve the user's goal? | Hard (DB/test) | Refund row exists in DB with correct amount |
+| **Trajectory Quality** | Was the path efficient and correct? | Soft (LLM judge) | Geometric mean of per-step scores >= 3.5/5 |
+| **Tool Accuracy** | Did the agent call the right tools correctly? | Hard (AST/schema) | Selection acc >= 95%, arg correct >= 90% |
+| **Output Quality** | Is the response helpful, coherent, safe? | Soft (rubric) | Faithfulness, tone, no PII leakage |
+| **Cost** | What did this task cost? | Hard (metering) | Per-task $ within 2x of baseline |
+| **Latency** | How long did it take? | Hard (tracing) | p95 < 30s end-to-end |
+
+### RAGAS Metrics for RAG Evaluation
+
+RAGAS provides claim-level evaluation for RAG systems. Understanding the specific constructs prevents common confusion:
+
+| Metric | Construct | WikiEval Agreement | Ship-Gate? |
+|---|---|---|---|
+| **Faithfulness** | Entailment: each claim in the answer is supported by retrieved context | ~95% | Yes (hard) |
+| **Context Recall** | What fraction of reference answer claims appear in retrieved context | -- | Yes (complementary to faithfulness) |
+| **Context Precision** | Are retrieved docs relevant to the question? (ID-based) | -- | Monitor |
+| **Answer Relevancy** | Is the answer relevant to the question? (cosine) | ~78% | No -- too noisy for gating |
+| **Context Relevance** | -- | ~70% | Monitor only |
+
+**Critical footgun**: Faithfulness can be 1.0 on the **wrong documents**. If your retriever pulls irrelevant chunks, the generator can be perfectly faithful to them while being factually wrong. Always pair faithfulness with context recall. Additionally, RAGAS faithfulness is entailment vs **retrieved context**, not world truth -- it will not catch answers that are faithful to retrieved docs but wrong about reality. That is a different construct (SimpleQA measures world-fact accuracy).
+
+**DeepEval trap**: DeepEval's default `FaithfulnessMetric` treats "I don't know" as supported and empty verdicts as 1.0 unless you set `penalize_ambiguous_claims=True`. This silently inflates scores. RAGAS entailment does not have this default.
+
+**Citation validation**: Citations are a **schema/constraint** problem, not an LLM-judge problem. Check that citation IDs are a subset of the retrieved document set deterministically. RAGAS will not catch a bare invented `[doc 17]`.
+
+**RAGAS Faithfulness walkthrough** (Einstein example): Answer claim "Einstein was born in Germany" gets a faithfulness score of 0.5 if only one of two claims is entailed by context. The metric decomposes the answer into atomic claims, checks each against context via NLI, and averages.
+
+### Agent Evaluation: Three-Layer Stack
+
+**Layer 1 -- End-to-End (Task Completion)**
+
+Binary or graded assessment of goal achievement. Success Rate (SR) is the primary metric. Critical distinction: execution completion is not task success. An agent that runs all steps but produces wrong output has 100% execution completion and 0% task success. Keep these metrics separate.
+
+**Layer 2 -- Trajectory Scoring**
+
+Scores the sequence of (state, action) pairs across the agent's execution. The 2026 standard uses an LLM judge scoring each pair on a 1-5 scale; the trajectory score is the **geometric mean** (not arithmetic).
+
+**Why geometric mean?** It punishes any single bad step severely:
+- **Arithmetic mean**: One catastrophic step (score=1) among 19 fine steps (score=5) gives (19 x 5 + 1) / 20 = **4.8** -- the bad step nearly vanishes.
+- **Geometric mean**: (5^19 x 1)^(1/20) = **4.17** -- the single failure drags the score down meaningfully.
+
+In financial contexts, one incorrect refund step among 19 correct steps must not vanish in an average. Geometric mean ensures this.
+
+Trajectory evaluation modes:
+- **Exact matching**: Fixed workflows where step order is prescribed
+- **Set-based matching**: Order-flexible -- correct steps in any sequence
+- **Partial-credit**: Fractional credit for partially correct actions
+- **LLM judge**: When multiple valid paths exist (most production scenarios)
+
+**Lucky pass detection**: AgentLens found that **10.7%** (range 0.5-23.2%) of agent passes are "lucky" -- the agent reached the right answer through an incorrect process. Process overlay (forbidden-action counts, trajectory scoring) catches these.
+
+**Layer 3 -- Component-Level (Tool Call Accuracy)**
+
+Decomposes into four sub-metrics:
+
+| Sub-Metric | Target | What It Catches |
+|---|---|---|
+| **Selection accuracy** | >= 95% | Agent picked wrong tool |
+| **Argument correctness** | >= 90% | Args syntactically/semantically invalid |
+| **Repetition rate** | < 5% | Duplicate calls wasting tokens/money |
+| **Error recovery** | Qualitative | Did agent recover from failed calls? |
+
+**BFCL (Berkeley Function Calling Leaderboard)** V4 bucket weights: 40/30/10/10/10. Tool-call evaluation uses AST matching (not string comparison) because argument order and formatting can vary without changing semantics.
+
+### LLM-as-Judge Bias Taxonomy
+
+Understanding judge biases is essential because an uncalibrated judge can show perfect dashboards while diverging from expert review. Each bias has a known mitigation:
+
+| Bias | Severity | Detection | Mitigation |
+|---|---|---|---|
+| **Position bias** | High | GPT-4 flipped preference on ~1/3 of MT-Bench pairwise cases when order was swapped | Evaluate both orderings; only count consistent verdicts. Use "Response A/B" not "1/2". **Cost: 2x inference, not optional.** |
+| **Length/verbosity bias** | Medium-High | Correlation analysis between response length and judge scores; HealthBench found significant length correlation | Explicit rubric: "concise responses score equal to or better than verbose at equivalent correctness." Length-controlled win rate for pairwise. |
+| **Self-preference bias** | Medium | Model rates own-style outputs higher by **+10%** (GPT-4) to **+25%** (Claude-v1) vs human ratings | Use different model family for judging than generation. Cross-model evaluation panels. |
+| **Rubric position bias** | Medium (2026 finding) | Reordering criteria within rubrics shifts scores | Randomize rubric option ordering across eval runs. |
+| **Compounding (FairJudge, Feb 2026)** | Critical | Position, length, formatting, and model provenance all shape verdicts. Frontier models exceeded **50% error rates** on bias tests. | FairJudge approach: SFT for base judge behavior, DPO targeting non-semantic biases, GRPO enforcing consistency across scoring modes. |
+
+**Few-shot helps consistency, not human agreement**: Zheng showed few-shot raised GPT-4 swap consistency from 65% to 77.5% at 4x cost -- but did not lift agreement with human judges. More expensive judging is not automatically better judging.
+
+**Chain-of-thought improves agreement**: Asking the judge to write a one-paragraph rationale before emitting the grade lifts inter-judge kappa from ~0.55 to ~0.75 on retrieval relevance tasks.
+
+**When NOT to use LLM-as-judge**: If a deterministic oracle exists (math correctness, code unit tests, JSON schema, DB state, citation ID membership), use that. ARE showed write-oracle agreement **0.98** vs whole-trace LLM judge **0.72**; precision **0.99** vs **0.53**. LLM judges are for the residual where no deterministic check is possible.
+
+### Human Evaluation: Inter-Annotator Agreement
+
+| Task Type | Metric | Target kappa |
+|---|---|---|
+| Objective (classification, entity extraction) | Cohen's/Fleiss' kappa | >= 0.90 |
+| Moderately subjective (relevance, coherence) | Cohen's/Fleiss' kappa | 0.70 - 0.85 |
+| Inherently subjective (creativity, style) | Krippendorff's alpha | 0.60 - 0.75 |
+
+**Kappa prevalence paradox**: Severe class imbalance produces surprisingly low kappa despite high raw agreement. If 90% of outputs are "pass," a judge that always says "pass" hits 90% raw agreement but kappa near zero. Always report prevalence alongside kappa.
+
+**Calibration protocol**:
+1. Written guidelines with 10-20 worked examples
+2. Calibration sessions: annotators independently rate gold examples, discuss disagreements
+3. Agreement gate: kappa > 0.6 on calibration set before production annotation begins
+4. Ongoing monitoring: 5-15% overlap, rolling IAA, quarterly recalibration
+
+**HealthBench anchor**: Physician-physician (MD-MD) agreement is only **55-75%** on medical quality rubrics. The benchmark has median **11** criteria per conversation, **48,562** unique criteria, and **5,000** conversations. Top model scores: o3 ~60%, GPT-4o ~32%, GPT-3.5-Turbo ~16%. HealthBench kept GPT-4.1 over o3 as grader because meta-eval F1 was higher (**0.709**) and cheaper -- reasoning models are not automatically better judges.
+
+### Benchmark Families and Contamination
+
+| Benchmark | Tasks | What It Measures | Key Numbers |
+|---|---|---|---|
+| **HumanEval** | 164 | Code generation (pass@k) | n=200 samples, 7.7 tests avg; HumanEval+ added 80x tests, dropped pass@k by **19.3-28.9%** |
+| **SWE-bench** | 2,294 (Lite 300, Verified 500) | Issue resolution against tests | Pro climbed 23.3% to 80.3% in 8 months; ~30% of tests broken; 19.78% semantically incorrect |
+| **tau-bench** | Retail + airline + telecom | Goal-state correctness in task envs | GPT-4.1: retail 74%, airline 56%, telecom 34% pass^1 |
+| **GAIA** | 466 questions | Broad tool-using reasoning | Humans 92%, GPT-4+plugins 15% |
+| **GAIA2** | 800 scenarios x 10 universes x 101 tools | Multi-tool agent eval | 160 mini set; attaches MCP |
+| **BFCL** | Function calling correctness | Tool/function call accuracy | V4 bucket weights: 40/30/10/10/10 |
+| **HealthBench** | 5,000 conversations | Medical rubric-heavy | 48,562 criteria; 55k grader calls/model |
+| **SimpleQA** | 4,326 items | World-fact accuracy | Informal grader disagreements: 2/300 |
+| **ARE** | Agent reasoning evaluation | Verifier vs whole-trace | Write-oracle 0.98 vs whole-trace 0.72 |
+
+**Contamination is real**:
+- **GSM1k vs GSM8k**: **8 pp** contamination gap -- models score higher on the public set they have seen.
+- **SWE-bench Verified**: OpenAI stopped reporting because models regurgitate gold patches.
+- **UC Berkeley RDI (April 2026)**: Automated scanning agent broke all eight major agent benchmarks (SWE-bench, WebArena, OSWorld, GAIA, Terminal-Bench, FieldWorkArena, CAR-bench) by reward hacking -- achieving near-perfect scores without solving a single task.
+- **SWE-bench inflation**: 5-15 points from training-data leakage. OpenAI audit: 59.4% of hardest Verified tasks have tests that would not catch the intended bug. A 90% headline score is closer to 75-80% real capability.
+
+**Takeaway**: Build internal private evals (50-200 representative tasks from your actual product). Weight independent evaluations heavily and lab marketing lightly.
+
+### Statistical Hygiene
+
+- **Unit = task**, not step. n=50 SWE instances is not n=1,000 steps. Pseudo-replication inflates statistical power.
+- **n < few hundred means no CLT**: Bootstrap confidence intervals instead.
+- **Miller worked example**: n ~ 969 needed for a 3 pp MDE (minimum detectable effect). Going from K=1 to K=10 retries on n=198 only reduces MDE from 13.2% to 7.5%.
+- **Paired comparison**: Compare candidate and baseline on the **same** tasks. Report paired SE, not independent SE.
+- **Report intervals, not points**: "83% +/- 2.1 pp (95% CI)" is a result. "83%" alone is not.
+
+---
+
+## Part 3: Token Economics and NFR Analysis
+
+### Cost of Evaluation
+
+**Judge cost guardrail**: Keep judge cost under 10-15% of production LLM cost. Act (reduce sampling or downgrade judge model) if approaching 25%.
+
+**1,000 judge calls** (2k input / 200 output per call):
+
+| Judge Model | Input Rate | Output Rate | Cost per 1k Calls | Notes |
+|---|---|---|---|---|
+| Claude Sonnet | $3/MTok | $15/MTok | ~$9 | Standard eval judge |
+| Claude Sonnet (cached prefix) | $0.30/MTok (cached) | $15/MTok | ~$1.10 | 90% input savings with stable rubric |
+| Claude Opus 5 | $5/MTok | $25/MTok | ~$15 | Highest accuracy, calibration runs |
+
+**Agent eval cost multipliers** (tau-style agent, 8k input / 1.5k output, 70% cache read on 6k prefix):
+
+| Component | Cost per 1k Tasks | Notes |
+|---|---|---|
+| Agent execution | ~$26 | Model calls + tool sim |
+| + LangSmith extended traces | ~$5 | $0.50 per 1k base, $5 extended |
+| + Judge (Sonnet) | ~$9 | 2k/200 rubric calls |
+| **Total per 1k tasks** | **~$40** | Without pass^k |
+| pass^5 multiplier | ~$48 agent alone | Agent+sim cost x ~4 (some env reuse) |
+| Nightly 200-task envelope | ~$12 uncached | Smoke test budget |
+
+**Benchmark suite costs**:
+
+| Suite | Tasks | Cost per Model per Run |
+|---|---|---|
+| SWE-bench Verified | 500 | $50 - $200 (depends on agent loop length) |
+| GAIA | 450+ | $30 - $100 |
+| HealthBench | 5,000 | 55k grader calls -- judge line is not rounding error |
+| Custom private eval | 200 | $5 - $20 (Sonnet-class judge) |
+| HAL tau-airline | varies | o4-mini High $11.36 vs Opus 4.1 $180.49 (snapshot) |
+
+**Online eval cost** (1M requests/month, 1% sampling):
+
+| Component | Monthly Cost |
+|---|---|
+| Judge calls (10k sampled x Sonnet) | ~$90 |
+| LangSmith upgrade (extended traces) | ~$50 |
+| **Total** | **~$140/month** |
+
+### Cost Optimization Strategies
+
+| Strategy | Savings | Tradeoff |
+|---|---|---|
+| Layered scoring (deterministic first) | 60-80% fewer LLM judge calls | Requires building deterministic checks |
+| Cached judge rubric (prompt caching) | 90% input cost reduction | Requires stable rubric prefix |
+| Distilled judge model | 10x cheaper per judgment | Slight accuracy loss on edge cases |
+| Batch API for offline evals | 50% cost reduction | Higher latency (async) |
+| Sample-based online scoring (5%) | 95% fewer production judge calls | Statistical sampling error |
+
+### Platform Pricing Comparison
+
+| Platform | Base/Trace Cost | Extended Cost | Seat Cost | Notes |
+|---|---|---|---|---|
+| **LangSmith** | $0.05 per 1k traces (14d) | $0.50 per 1k traces (400d) | $39/seat (Plus) | Max 25k runs/trace; evaluator spend-cap resets Monday 00:00 UTC |
+| **Braintrust** | Free tier | $1.50 per 1k on-demand scores | $249/seat (Pro) | 30s idle default; 10k function executions/10s; 20 MB/span |
+| **Datadog LLM Obs** | $0.35 per 1k LLM spans | -- | $160/100k LLM spans | Standard Datadog pricing model |
+| **DeepEval** | Free (OSS) | Confident AI hosted: $19.99/user/month | -- | pytest-style, CI-native |
+| **RAGAS** | Free (fully OSS) | -- | -- | RAG-specific metrics |
+| **Promptfoo** | Free (OSS) | -- | -- | Matrix comparison, config-driven |
+| **Arize Phoenix** | Free (self-hosted OSS) | -- | -- | `llm_classify` default max_retries=10 |
+
+**Death dates (plan migrations accordingly)**:
+- Promptfoo acquisition agreement: **2026-03-09**
+- OpenAI Hosted Evals read-only: **2026-10-31**
+- OpenAI Hosted Evals shutdown: **2026-11-30**
+
+### Latency SLA Targets
+
+| Tier | p50 | p95 | p99 | Notes |
+|---|---|---|---|---|
+| **User-path eval tax** | **0 ms** | **0 ms** | **0 ms** | Non-negotiable -- judge is async sidecar |
+| Deterministic oracle sidecar | 20 ms | 80 ms | 250 ms | DB check, schema validation |
+| LLM judge compute (2k/200) | 1,200 ms | 4,000 ms | 12,000 ms | Single rubric call |
+| Time-to-score (with 30s idle) | 31,200 ms | 34,000 ms | 42,000 ms | Braintrust idle + judge |
+| Braintrust inline scorer | -- | -- | 240,000 ms | 4-minute timeout |
+| Gaia2 scenario timeout | -- | -- | 300,000 ms | 5-minute timeout |
+| Single pairwise comparison | 4s | 10s | 25s | Parallel execution recommended |
+| Full suite (500 rows) | 5 min | 12 min | 20 min | 10-20 concurrent workers |
+| CI gate (PR-level) | 3 min | 8 min | 15 min | Subset sampling for PR, full suite nightly |
+
+**Critical anti-pattern**: If someone inlines the judge on the user path, they buy **+12s on user p99** and judge 429s become user 500s. This is not a theoretical risk -- it is the most common eval architecture mistake.
+
+### Throughput and Back-Pressure
+
+Eval pipeline throughput depends on LLM provider rate limits (typical: 60-500 RPM). Design for back-pressure:
+- Use a queue (SQS/Redis/Kafka) between eval runner and scorer
+- Implement concurrency control (semaphore limiting parallel judge calls)
+- Monitor queue depth -- alert if >1,000 pending evals (indicates eval backlog)
+
+**Capacity planning** (500-row suite, pairwise): 1,000 LLM calls x avg 800 tokens = 800K tokens. At $3/MTok (Sonnet): $2.40/run. At 100 RPM rate limit: ~10 min wall clock. Scale: 10 PRs/day x $2.40 = $24/day eval cost.
+
+**LangSmith ingest limits**: Developer (no card) 50k traces / 500 MB per UTC hour. Plus: 500k traces / 5 GB per UTC hour. At 10 spans/task, Plus headroom is ~50k tasks/hour.
+
+### NFR Targets
+
+| Dimension | Target | Notes |
+|---|---|---|
+| CI gate latency | < 15 min for 500-row suite | Layered scoring reduces wall time |
+| Judge availability | 99.5% (fallback judge configured) | Primary: Opus/Sonnet; Fallback: Haiku |
+| Test-retest reliability | kappa >= 0.80 same judge, same inputs | Score same outputs twice, measure agreement |
+| Online eval sampling | 5-10% of production traffic | Reservoir sampling for representative coverage |
+| Alert SLA | < 5 min from sustained score drop to alert | Individual outliers are noise, sustained drops are signal |
+| Coverage% | >= 95% of eligible tasks scored | `score IS NOT NULL` alert; unscored != passed |
+| Spend-cap backfill | No silent skip on cap hit | LangSmith resets Monday 00:00 UTC; missed runs are not backfilled |
+
+---
+
+## Part 4: Distributed Resilience and Security
+
+### Judge Availability and Fallback Chain
+
+The judge model is a single point of failure for the entire eval pipeline. Design a fallback chain:
+
+```
+Primary Judge (Opus/Sonnet)
+    │
+    ├── Circuit breaker: 5 failures in 60s → open
+    │
+    ▼ (breaker open)
+Fallback Judge (Haiku / cheaper model)
+    │
+    ├── If also failing...
+    │
+    ▼ (both failing)
+Online: SKIP score (never block user)
+CI:     ERROR status (fail the build, do not pass silently)
+```
+
+**Key invariant**: A tripped judge breaker skips the score in online mode -- it does not fail the user's refund. In CI mode, a tripped breaker errors the build -- it does not pass silently. This asymmetry (fail-open online, fail-closed CI) is the correct default.
+
+### Flaky CI Builds from LLM Non-Determinism
+
+Temperature=0 does not guarantee determinism across API calls (SD > 1.5 pp). Mitigations:
+- Use **tolerance bands** instead of exact thresholds (e.g., pass if score >= 0.83 rather than >= 0.85)
+- Pin the judge model version explicitly
+- Sample a stable golden test set
+- Cache judge responses for identical inputs
+- Report `grader_status` separately: Inspect NaN when n < k, bucket infra errors separately from task failures
+
+### Dataset Versioning
+
+Eval datasets must be versioned alongside code. A score change can come from dataset drift, not model regression. Use content-addressable storage or git-tracked fixtures. Every score record includes `dataset_version` so that a historical score is reproducible.
+
+### Checkpointing for Long-Running Suites
+
+For 500+ item suites, implement checkpointing: persist partial results so a crash at item 400 does not lose items 1-399. Braintrust and LangSmith both support incremental result uploads. The checkpoint file is a JSONL of per-row results.
+
+### Durable Execution (Temporal Sketch)
+
+For production eval infrastructure at scale:
+- Workflow ID = `run_key(suite, dataset_version, harness_commit, judge_model, trial_id)`
+- Activity per task with sandbox lease
+- On `TransientError`: retry with jitter
+- On poison (deadline exceeded): DLQ with `grader_status=timeout`
+- Compensation writes `SKIPPED`, never `passed=true`
+- Replay-safe: re-running a workflow with the same ID is idempotent
+
+### Zero-Trust MCP for Eval Harness
+
+GAIA2 and ARE attach MCP tools to the eval harness. An untrusted MCP server is RCE-adjacent. The failure mode is an eval bot with the user's refresh token calling corporate Git or live Stripe.
+
+| Principle | Implementation |
+|---|---|
+| Audience-restricted tokens | Per-MCP-server token with narrow scope |
+| URL allowlist | Only sim_* endpoints, not production APIs |
+| Ephemeral sandbox | Docker containers per trial, destroyed after |
+| Identity from RunContext | Never from model output or user prompt |
+| Tool RBAC | `dataset.write` never on a tool the model can call |
+| Online judge breaker | Skip score on failure, never block user request |
+
+### RBAC for Evaluation Systems (Four-Role Model)
+
+| Role | Permissions | Cannot Do |
+|---|---|---|
+| **Operator** | Run evals, view aggregate scores | Access PII, modify datasets |
+| **Auditor** | PII unmasking (dual approval), inspect individual traces | Modify datasets, change thresholds |
+| **Compliance Owner** | Retention policies, legal hold | Modify eval logic |
+| **Security** | Audit-of-audit log access | Modify anything else |
+
+### PII Pipeline: Detect, Redact, Audit
+
+PII handling in evaluation is a legal record problem, not just a privacy concern:
+
+```
+Production Trace
+    │
+    ▼
+DETECT (NER + regex + Presidio)
+    │
+    ▼
+REDACT (tokenize, keep structure: "ada@example.com" → "<EMAIL_1>")
+    │
+    ▼
+AUDIT (log data category + hash, NOT raw spans)
+    │
+    ▼
+INGEST into dataset / judge input
+```
+
+**Key rules**:
+- Detect, redact, audit **before ingest** -- a trace promoted to a golden dataset with PII becomes immortal (14-day debug TTL becomes forever)
+- LangSmith anonymizer / hide flags; OpenInference HIDE_*; Braintrust mask
+- Hide-all makes offline eval impossible -- tokenize and keep structure instead
+- The judge sees already-redacted text, or you have a second subprocessor agreement
+- PCI cardholder data does not go to LangSmith at all
+- Who changed goldens: dataset versions + git of the suite; log `evaluator_version` on every score
+
+### EU AI Act Context (Effective August 2026)
+
+High-risk AI system obligations require:
+- Risk management systems
+- Data governance
+- Record-keeping / logging (immutable audit trails)
+- Transparency
+- Human oversight
+
+Eval audit trails (who ran what, which model, which dataset, what scores, what gating decisions) are directly relevant to compliance. The persistence layer must be tamper-evident and exportable to SIEM.
+
+### Governance Platforms (2026)
+
+| Platform | Strength |
+|---|---|
+| **Braintrust** | Eval scoring + production traces + human review + CI release gates |
+| **Galileo** | Runtime protection blocking unsafe outputs with audit trails + policy versioning |
+| **Credo AI** | Portfolio-level governance across many AI systems with registries + risk assessments |
+| **Lakera** | AI-native runtime security: prompt injection defense, PII protection |
+| **Bifrost** | Open-source AI gateway: governance, budgets, access control, audit logs |
+
+---
+
+## Part 5: Production Enterprise Code
+
+```python
+"""
+Production eval system: pass@k / pass^k estimators, dual-oracle gate,
+layered scorer pipeline, trajectory scoring, circuit breaker, PII pipeline,
+online monitor. Merge of best patterns from all research sources.
+
+Requires: structlog, tenacity. LLM API calls are stubbed for portability.
+"""
+
+import hashlib
+import json
+import logging
+import math
+import random
+import time
+import uuid
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from math import comb, lgamma, exp, log
+from pathlib import Path
+from typing import Optional, NamedTuple
+
+import structlog
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+)
+
+logger = structlog.get_logger()
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  Structured logging helper
+# ───────────────────────────────────────────────────────────────────────
+
+def slog(level: int, event: str, **kw):
+    """Structured log with correlation fields (cid, tenant, layer)."""
+    logger.log(level, event, **kw)
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  pass@k and pass^k estimators
+# ───────────────────────────────────────────────────────────────────────
+
+def pass_at_k(n: int, c: int, k: int) -> float:
+    """Unbiased pass@k (Chen et al., HumanEval).
+
+    Returns the probability that at least one of k samples passes.
+    Uses log-space to avoid overflow on large n.
+    Returns NaN when n < k (Inspect convention -- do not extrapolate).
+    """
+    if n < k:
+        return float("nan")
+    if c == 0:
+        return 0.0
+    if c == n:
+        return 1.0
+    # 1 - C(n-c, k) / C(n, k), computed in log-space
+    log_numerator = lgamma(n - c + 1) - lgamma(n - c - k + 1) - lgamma(k + 1)
+    log_denominator = lgamma(n + 1) - lgamma(n - k + 1) - lgamma(k + 1)
+    return 1.0 - exp(log_numerator - log_denominator)
+
+
+def pass_hat_k(n: int, c: int, k: int) -> float:
+    """pass^k reliability estimator (Inspect, without replacement).
+
+    Returns the probability that ALL k trials succeed.
+    NaN when n < k.
+    """
+    if n < k:
+        return float("nan")
+    if c < k:
+        return 0.0
+    return comb(c, k) / comb(n, k)
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  Run key: immutable experiment identity
+# ───────────────────────────────────────────────────────────────────────
+
+def run_key(
+    suite_id: str,
+    dataset_version: str,
+    harness_commit: str,
+    judge_model: str,
+    trial_id: str,
+) -> str:
+    """Deterministic key for an experiment run.
+
+    Includes harness_commit so a scaffold change is a new measurement.
+    SWE-bench caches on (run_id, instance_id) -- reusing run_id with
+    a different patch is a silent no-op. Always mint a new key.
+    """
+    parts = f"{suite_id}|{dataset_version}|{harness_commit}|{judge_model}|{trial_id}"
+    return hashlib.sha256(parts.encode()).hexdigest()[:16]
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  Dual-oracle gate
+# ───────────────────────────────────────────────────────────────────────
+
+class GraderStatus(Enum):
+    SCORED = "scored"
+    SKIPPED = "skipped"
+    ERROR = "error"
+    TIMEOUT = "timeout"
+
+
+@dataclass
+class OracleResult:
+    passed: Optional[bool]
+    status: GraderStatus
+    grader: str
+    score: float = 0.0
+
+
+class GateDecision(NamedTuple):
+    ship: bool
+    reason: str
+
+
+def dual_oracle_gate(
+    hard: OracleResult,
+    soft: OracleResult,
+    soft_threshold: float = 0.85,
+    min_coverage: float = 0.95,
+    scored: int = 1,
+    eligible: int = 1,
+) -> GateDecision:
+    """Combine hard + soft oracle into a ship/hold decision.
+
+    Rules:
+    1. Hard fail => HOLD, regardless of soft score.
+    2. Hard error => HOLD in CI (fail-closed).
+    3. Soft score below threshold => HOLD.
+    4. Coverage below floor => HOLD (unscored != passed).
+    5. All checks pass => SHIP.
+    """
+    if hard.status == GraderStatus.ERROR:
+        return GateDecision(False, "hard_oracle_error")
+    if hard.passed is False:
+        return GateDecision(False, "hard_fail")
+    coverage = scored / eligible if eligible > 0 else 0.0
+    if coverage < min_coverage:
+        return GateDecision(False, f"coverage_{coverage:.2f}_below_{min_coverage}")
+    if soft.status == GraderStatus.SKIPPED:
+        return GateDecision(True, "soft_skipped_hard_passed")
+    if soft.score < soft_threshold:
+        return GateDecision(False, f"soft_{soft.score:.2f}_below_{soft_threshold}")
+    return GateDecision(True, "all_checks_passed")
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  Circuit breaker for judge model
+# ───────────────────────────────────────────────────────────────────────
+
+class CircuitBreaker:
+    """Three-state circuit breaker (closed -> open -> half_open).
+
+    After failure_threshold consecutive failures, opens for reset_timeout
+    seconds. In half_open, allows one probe; success closes, failure reopens.
+    """
+
+    def __init__(self, failure_threshold: int = 5, reset_timeout: float = 60.0):
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        self.failure_count = 0
+        self.last_failure_time = 0.0
+        self.state = "closed"
+
+    def allow(self) -> bool:
+        if self.state == "closed":
+            return True
+        if self.state == "open":
+            if time.time() - self.last_failure_time > self.reset_timeout:
+                self.state = "half_open"
+                return True
+            return False
+        return True  # half_open: allow one probe
+
+    def record_success(self):
+        self.failure_count = 0
+        self.state = "closed"
+
+    def record_failure(self):
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        if self.failure_count >= self.failure_threshold:
+            self.state = "open"
+            slog(logging.WARNING, "circuit_breaker_opened",
+                 failure_count=self.failure_count)
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  Retry with jitter
+# ───────────────────────────────────────────────────────────────────────
+
+class TransientError(Exception):
+    pass
+
+
+def retry_with_jitter(fn, *, cid: str, tenant: str, op: str, max_retries: int = 3):
+    """Retry with exponential backoff + jitter. Raises on exhaustion."""
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except TransientError as exc:
+            wait = (2 ** attempt) + random.uniform(0, 1)
+            slog(logging.WARNING, f"retry_{op}",
+                 cid=cid, tenant=tenant, attempt=attempt, wait=round(wait, 2))
+            time.sleep(wait)
+    raise TransientError(f"{op}_exhausted_after_{max_retries}")
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  PII detection, redaction, and audit
+# ───────────────────────────────────────────────────────────────────────
+
+@dataclass
+class PIIAuditRecord:
+    cid: str
+    tenant: str
+    categories: list  # ["email", "phone"] -- types detected, not raw spans
+    sha256: str       # hash of original text for forensic linking
+    redacted: str     # text with PII replaced by tokens
+
+
+def pii_detect_redact_audit(text: str, *, cid: str, tenant: str) -> PIIAuditRecord:
+    """Detect -> Redact -> Audit pipeline.
+
+    In production: plug in Presidio / custom NER.
+    Key: log data CATEGORY and HASH, never raw PII spans.
+    Runs BEFORE ingest into dataset or judge input.
+    """
+    import re
+    categories = []
+    redacted = text
+
+    # Email detection
+    if re.search(r"[\w.-]+@[\w.-]+\.\w+", text):
+        categories.append("email")
+        redacted = re.sub(r"[\w.-]+@[\w.-]+\.\w+", "<EMAIL>", redacted)
+
+    # Phone detection (simple pattern)
+    if re.search(r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b", text):
+        categories.append("phone")
+        redacted = re.sub(r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b", "<PHONE>", redacted)
+
+    record = PIIAuditRecord(
+        cid=cid,
+        tenant=tenant,
+        categories=categories,
+        sha256=hashlib.sha256(text.encode()).hexdigest(),
+        redacted=redacted,
+    )
+    if categories:
+        slog(logging.INFO, "pii_redacted",
+             cid=cid, tenant=tenant, categories=categories,
+             sha256=record.sha256[:12])
+    return record
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  Layered scorer (deterministic -> heuristic -> LLM judge)
+# ───────────────────────────────────────────────────────────────────────
+
+class ScorerTier(Enum):
+    DETERMINISTIC = "deterministic"
+    HEURISTIC = "heuristic"
+    LLM_JUDGE = "llm_judge"
+
+
+@dataclass
+class EvalRow:
+    row_id: str
+    input_text: str
+    expected_output: str
+    candidate_output: str = ""
+    scores: dict = field(default_factory=dict)
+    passed_tiers: list = field(default_factory=list)
+    final_score: float = 0.0
+
+
+def score_deterministic(row: EvalRow) -> Optional[float]:
+    """Tier 1: Format and schema validation. Milliseconds, zero ambiguity.
+
+    Returns 0.0 on failure (hard fail, skip remaining tiers).
+    Returns None on pass (continue to next tier).
+    """
+    output = row.candidate_output.strip()
+    if not output:
+        row.scores["deterministic"] = 0.0
+        return 0.0
+    # JSON parsability check if expected is JSON
+    if row.expected_output.strip().startswith("{"):
+        try:
+            json.loads(output)
+        except json.JSONDecodeError:
+            row.scores["deterministic"] = 0.0
+            return 0.0
+    row.scores["deterministic"] = 1.0
+    row.passed_tiers.append(ScorerTier.DETERMINISTIC)
+    return None
+
+
+def score_heuristic(row: EvalRow) -> Optional[float]:
+    """Tier 2: Length bounds and keyword checks.
+
+    Catches structural issues before expensive LLM judge.
+    """
+    output = row.candidate_output.strip()
+    if len(output) < 10:
+        row.scores["heuristic"] = 0.2
+        return 0.2
+    if len(output) > 50_000:
+        row.scores["heuristic"] = 0.3
+        return 0.3
+    row.scores["heuristic"] = 1.0
+    row.passed_tiers.append(ScorerTier.HEURISTIC)
+    return None
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  Eval runtime: orchestrates hard + soft oracle with breaker + PII
+# ───────────────────────────────────────────────────────────────────────
+
+class EvalRuntime:
+    """Full eval runtime with dual-oracle, circuit breaker, and PII.
+
+    Online: skip score on breaker open (never block user).
+    CI: error on breaker open (never pass silently).
+    """
+
+    def __init__(self):
+        self.judge_breaker = CircuitBreaker(failure_threshold=5, reset_timeout=60)
+
+    def score_task(
+        self,
+        *,
+        cid: str,
+        tenant: str,
+        key: str,
+        db_goal_met: bool,
+        output_redacted: str,
+        online: bool = False,
+    ) -> tuple[OracleResult, OracleResult]:
+        """Score a single task through both oracles.
+
+        Hard oracle: deterministic (DB goal state, policy assertions).
+        Soft oracle: LLM judge rubric (tone, completeness).
+        Hard fail => skip soft (never average safety into quality).
+        """
+        # --- Hard oracle ---
+        hard = OracleResult(
+            passed=db_goal_met,
+            status=GraderStatus.SCORED,
+            grader="db_goal",
+            score=1.0 if db_goal_met else 0.0,
+        )
+
+        if not db_goal_met:
+            slog(logging.WARNING, "hard_fail_skip_soft",
+                 cid=cid, tenant=tenant, layer="hard")
+            soft = OracleResult(None, GraderStatus.SKIPPED, "skipped_hard_fail")
+            return hard, soft
+
+        # --- Soft oracle (with breaker) ---
+        judge_ok = random.random() > 0.1  # Simulate 10% judge failure rate
+        soft = self._soft_or_skip(
+            cid, tenant, output_redacted,
+            online=online, judge_ok=judge_ok,
+        )
+        return hard, soft
+
+    def _soft_or_skip(
+        self,
+        cid: str,
+        tenant: str,
+        text: str,
+        *,
+        online: bool,
+        judge_ok: bool,
+    ) -> OracleResult:
+        """Soft oracle with circuit breaker fallback.
+
+        Breaker open + online => SKIP (0 ms eval tax).
+        Breaker open + CI => ERROR (fail the build).
+        """
+        if not self.judge_breaker.allow():
+            slog(logging.WARNING,
+                 "judge_open_skip" if online else "judge_open_ci",
+                 cid=cid, tenant=tenant, layer="judge")
+            if online:
+                return OracleResult(None, GraderStatus.SKIPPED, "breaker_open")
+            return OracleResult(None, GraderStatus.ERROR, "breaker_open_ci")
+
+        try:
+            def _judge() -> OracleResult:
+                if not judge_ok:
+                    raise TransientError("judge_429")
+                # Rubric call: length is NOT a criterion
+                # (HealthBench length correlation is a known bias).
+                score = 0.0 if "hostile" in text.lower() else 0.91
+                return OracleResult(True, GraderStatus.SCORED, "rubric", score)
+
+            result = retry_with_jitter(_judge, cid=cid, tenant=tenant, op="judge")
+            self.judge_breaker.record_success()
+            return result
+        except TransientError as exc:
+            self.judge_breaker.record_failure()
+            slog(logging.WARNING, "fallback_cheap_judge",
+                 cid=cid, tenant=tenant, layer="judge", err=str(exc))
+            if online:
+                return OracleResult(None, GraderStatus.SKIPPED, "skip_online")
+            # CI: cheap fallback, not a pass
+            cheap = 0.5 if len(text) > 0 else 0.0
+            return OracleResult(True, GraderStatus.SCORED, "cheap_fallback", cheap)
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  Trajectory scorer (geometric mean)
+# ───────────────────────────────────────────────────────────────────────
+
+@dataclass
+class TrajectoryStep:
+    step_index: int
+    action: str
+    tool_name: Optional[str]
+    tool_args: Optional[dict]
+    result: str
+    score: float = 0.0  # 1-5 scale, set by judge
+
+
+def geometric_mean(scores: list[float]) -> float:
+    """Geometric mean -- punishes any single bad step.
+
+    One score=1 among 19 score=5 steps:
+      Arithmetic: (19*5 + 1)/20 = 4.8 (bad step vanishes)
+      Geometric:  (5^19 * 1)^(1/20) = 4.17 (failure drags score down)
+    """
+    if not scores:
+        return 0.0
+    product = 1.0
+    for s in scores:
+        if s <= 0:
+            return 0.0
+        product *= s
+    return product ** (1.0 / len(scores))
+
+
+def score_trajectory(steps: list[TrajectoryStep]) -> dict:
+    """Score an agent trajectory.
+
+    Returns geometric mean (production metric), arithmetic mean
+    (for comparison), and per-step breakdown.
+    """
+    raw_scores = [s.score for s in steps]
+    normalized = [s / 5.0 for s in raw_scores]  # Normalize to 0-1
+
+    geo = geometric_mean(normalized)
+    arith = sum(normalized) / len(normalized) if normalized else 0.0
+
+    return {
+        "geometric_mean": round(geo, 4),
+        "arithmetic_mean": round(arith, 4),
+        "step_count": len(steps),
+        "min_step_score": min(raw_scores) if raw_scores else 0,
+        "per_step": [
+            {"step": s.step_index, "action": s.action, "score": s.score}
+            for s in steps
+        ],
+    }
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  Eval pipeline orchestrator with checkpointing
+# ───────────────────────────────────────────────────────────────────────
+
+@dataclass
+class EvalRunResult:
+    run_id: str
+    dataset_version: str
+    model_name: str
+    prompt_hash: str
+    total_rows: int
+    passed_rows: int
+    avg_score: float
+    per_row_results: list
+    duration_seconds: float
+    judge_cost_usd: float
+    gate_passed: bool
+
+
+class EvalPipeline:
+    """Orchestrates layered evaluation with checkpointing.
+
+    Tier 1 (deterministic) filters gross failures in milliseconds.
+    Tier 2 (heuristic) catches structural issues cheaply.
+    Tier 3 (LLM judge) runs only on survivors -- keeps cost proportional.
+    """
+
+    def __init__(
+        self,
+        runtime: EvalRuntime,
+        gate_threshold: float = 0.85,
+        checkpoint_dir: Optional[str] = None,
+    ):
+        self.runtime = runtime
+        self.gate_threshold = gate_threshold
+        self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
+        self.completed_rows: list[dict] = []
+
+    def _checkpoint(self, row_result: dict):
+        """Persist partial results for crash recovery (JSONL)."""
+        self.completed_rows.append(row_result)
+        if self.checkpoint_dir:
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            cp_path = self.checkpoint_dir / "checkpoint.jsonl"
+            with open(cp_path, "a") as f:
+                f.write(json.dumps(row_result) + "\n")
+
+    def _load_checkpoint(self) -> set:
+        """Resume from checkpoint: load completed row IDs."""
+        completed_ids = set()
+        if self.checkpoint_dir:
+            cp_path = self.checkpoint_dir / "checkpoint.jsonl"
+            if cp_path.exists():
+                with open(cp_path) as f:
+                    for line in f:
+                        data = json.loads(line.strip())
+                        completed_ids.add(data["row_id"])
+                        self.completed_rows.append(data)
+        return completed_ids
+
+    def run(
+        self,
+        dataset: list[EvalRow],
+        dataset_version: str,
+        model_name: str,
+        prompt_template: str,
+    ) -> EvalRunResult:
+        start_time = time.time()
+        prompt_hash = hashlib.sha256(prompt_template.encode()).hexdigest()[:12]
+        rk = run_key("suite-1", dataset_version, "harness@HEAD",
+                      model_name, str(uuid.uuid4())[:8])
+
+        completed_ids = self._load_checkpoint()
+        slog(logging.INFO, "eval_run_started",
+             run_id=rk, total_rows=len(dataset), resumed=len(completed_ids))
+
+        for row in dataset:
+            if row.row_id in completed_ids:
+                continue
+
+            # Tier 1: Deterministic (milliseconds)
+            result = score_deterministic(row)
+            if result is not None:
+                row.final_score = result
+                self._checkpoint({"row_id": row.row_id, "score": result,
+                                   "tier": "deterministic"})
+                continue
+
+            # Tier 2: Heuristic (cheap)
+            result = score_heuristic(row)
+            if result is not None:
+                row.final_score = result
+                self._checkpoint({"row_id": row.row_id, "score": result,
+                                   "tier": "heuristic"})
+                continue
+
+            # Tier 3: Dual-oracle (expensive, only on survivors)
+            pii = pii_detect_redact_audit(
+                row.candidate_output, cid=row.row_id, tenant="eval")
+            hard, soft = self.runtime.score_task(
+                cid=row.row_id, tenant="eval",
+                key=rk, db_goal_met=True,
+                output_redacted=pii.redacted, online=False,
+            )
+            gate = dual_oracle_gate(hard, soft, soft_threshold=self.gate_threshold)
+            row.final_score = soft.score if soft.status == GraderStatus.SCORED else 0.5
+            self._checkpoint({"row_id": row.row_id, "score": row.final_score,
+                               "tier": "llm_judge", "ship": gate.ship})
+
+        duration = time.time() - start_time
+        scores = [r["score"] for r in self.completed_rows]
+        avg_score = sum(scores) / len(scores) if scores else 0.0
+        passed = sum(1 for s in scores if s >= self.gate_threshold)
+
+        result = EvalRunResult(
+            run_id=rk, dataset_version=dataset_version,
+            model_name=model_name, prompt_hash=prompt_hash,
+            total_rows=len(dataset), passed_rows=passed,
+            avg_score=round(avg_score, 4),
+            per_row_results=self.completed_rows,
+            duration_seconds=round(duration, 2),
+            judge_cost_usd=0.0,  # Track via API response headers in prod
+            gate_passed=avg_score >= self.gate_threshold,
+        )
+        slog(logging.INFO, "eval_run_completed",
+             run_id=rk, avg_score=result.avg_score,
+             gate_passed=result.gate_passed, duration_s=result.duration_seconds)
+        return result
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  Online eval monitor with drift detection
+# ───────────────────────────────────────────────────────────────────────
+
+class OnlineEvalMonitor:
+    """Samples production traffic async, detects sustained quality drift.
+
+    Key: 0 ms eval tax on user path. Scoring happens in sidecar.
+    Alert on sustained drops (3+ consecutive windows below threshold),
+    not individual outliers.
+    """
+
+    def __init__(
+        self,
+        sample_rate: float = 0.05,
+        window_size: int = 1000,
+        alert_threshold: float = 0.80,
+        sustained_drop_count: int = 3,
+    ):
+        self.sample_rate = sample_rate
+        self.window_size = window_size
+        self.alert_threshold = alert_threshold
+        self.sustained_drop_count = sustained_drop_count
+        self.score_window: deque = deque(maxlen=window_size)
+        self.rolling_averages: list[dict] = []
+        self.consecutive_drops = 0
+
+    def should_sample(self) -> bool:
+        return random.random() < self.sample_rate
+
+    def record_score(self, trace_id: str, score: float, metadata: dict):
+        self.score_window.append({
+            "trace_id": trace_id,
+            "score": score,
+            "timestamp": datetime.utcnow().isoformat(),
+            "metadata": metadata,
+        })
+        self._check_drift()
+
+    def _check_drift(self):
+        if len(self.score_window) < 50:
+            return
+        recent = list(self.score_window)[-100:]
+        avg = sum(r["score"] for r in recent) / len(recent)
+        self.rolling_averages.append({
+            "timestamp": datetime.utcnow().isoformat(),
+            "avg_score": round(avg, 4),
+        })
+        if avg < self.alert_threshold:
+            self.consecutive_drops += 1
+            if self.consecutive_drops >= self.sustained_drop_count:
+                slog(logging.ERROR, "quality_drift_alert",
+                     avg_score=round(avg, 4),
+                     threshold=self.alert_threshold,
+                     consecutive_drops=self.consecutive_drops)
+        else:
+            self.consecutive_drops = 0
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  Async user-path integration (0 ms eval tax)
+# ───────────────────────────────────────────────────────────────────────
+
+def user_request_then_eval_async(
+    runtime: EvalRuntime,
+    *,
+    cid: str,
+    tenant: str,
+    user_output: str,
+    db_goal_met: bool,
+) -> str:
+    """User path returns immediately. Sidecar scores later (0 ms eval tax).
+
+    In production: enqueue (cid, redacted, db_goal_met) to Kafka/Temporal.
+    The judge runs out-of-band; a tripped breaker skips the score
+    rather than failing the user's request.
+    """
+    pii = pii_detect_redact_audit(user_output, cid=cid, tenant=tenant)
+    slog(logging.INFO, "user_complete", cid=cid, tenant=tenant, layer="serve")
+    # Async: in production, this is enqueued, not called inline
+    runtime.score_task(
+        cid=cid, tenant=tenant,
+        key=run_key("suite-1", "ds-v3", "harness@abc", "sonnet", cid),
+        db_goal_met=db_goal_met,
+        output_redacted=pii.redacted,
+        online=True,
+    )
+    return user_output  # Returns immediately -- never waits on judge
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  Demo
+# ───────────────────────────────────────────────────────────────────────
+
+def demo():
+    random.seed(0)
+
+    # --- Estimator examples ---
+    trials = [True, True, False, True, True]  # 4/5 pass
+    n, c = len(trials), sum(1 for t in trials if t)
+    print(f"pass@1 = {pass_at_k(n, c, 1):.4f}")    # 0.8000
+    print(f"pass@3 = {pass_at_k(n, c, 3):.4f}")    # 0.9000
+    print(f"pass^1 = {pass_hat_k(n, c, 1):.4f}")   # 0.8000
+    print(f"pass^3 = {pass_hat_k(n, c, 3):.4f}")   # 0.4000
+    print(f"pass@k(n=2, c=2, k=5) = {pass_at_k(2, 2, 5)}")  # NaN
+
+    # --- Dual-oracle gate ---
+    rt = EvalRuntime()
+    cid = str(uuid.uuid4())
+    hard, soft = rt.score_task(
+        cid=cid, tenant="acme",
+        key=run_key("suite-1", "ds-v3", "harness@abc", "sonnet", "run-1"),
+        db_goal_met=True,
+        output_redacted="Refund issued per policy.",
+        online=False,
+    )
+    gate = dual_oracle_gate(hard, soft, soft_threshold=0.85)
+    print(f"Gate: ship={gate.ship}, reason={gate.reason}")
+
+    # --- Trajectory scoring ---
+    steps = [
+        TrajectoryStep(0, "lookup_account", "db_query", {"id": 123}, "found", 5.0),
+        TrajectoryStep(1, "check_policy", "policy_api", {"type": "refund"}, "ok", 4.0),
+        TrajectoryStep(2, "process_refund", "payment_api", {"amt": 50}, "done", 5.0),
+        TrajectoryStep(3, "confirm_user", None, None, "Your refund is processed", 5.0),
+    ]
+    traj = score_trajectory(steps)
+    print(f"Trajectory: geo={traj['geometric_mean']}, arith={traj['arithmetic_mean']}")
+
+    # --- Online async (0 ms eval tax) ---
+    user_request_then_eval_async(
+        rt,
+        cid=str(uuid.uuid4()),
+        tenant="acme",
+        user_output="Done, emailed ada@example.com",
+        db_goal_met=True,
+    )
+
+
+if __name__ == "__main__":
+    demo()
+```
+
+**What to recode from memory in an interview**: (1) Chen product vs naive 1-(1-p)^k; (2) Inspect NaN when n < k; (3) hard fail => skip soft, never average; (4) judge breaker open => skip online / error in CI; (5) PII audit logs hashes and types, not spans; (6) `run_key` includes harness commit so a scaffold change is a new measurement; (7) geometric mean for trajectory scoring.
+
+---
+
+## Part 6: Architectural System Design Scenarios
+
+### Scenario A -- Dual-Oracle Release Gate for a Policy-Bound Support Agent
+
+**Problem.** A tau-style support agent (refunds, bookings, plan changes) must not ship a prompt/model that is "nicer" but books the wrong fare class or refunds above cap. Users get one try. The team today quotes a single-run pass@1 on a 50-item golden set and an LLM judge on the utterance ("looks booked"). Requirements: fail-closed CI, fail-open online, PII-safe promotion, no judge on user p99.
+
+**Architecture:**
+
+```
+  ┌─────────────┐   ┌──────────────────────────────────────────────────┐
+  │ IdP / PEP   │──>│ CONTROL: pin as_of + harness_commit + k=5        │
+  │ JWT->tenant │   │   hard: tau sim + DB goal + policy assertions    │
+  │             │   │   tool unit: BFCL-style AST / Promptfoo is-json  │
+  │             │   │   CI: pass^5 + coverage of pinned set            │
+  │             │   │   stats: paired vs last ship; bootstrap if n<200 │
+  └─────────────┘   └──────────────────┬───────────────────────────────┘
+                                       v
+                    ┌──────────────────────────────────────────────────┐
+                    │ DATA: prod agent (same scaffold as CI)           │
+                    │   sim_* MCP only in eval; prod tools in serve    │
+                    │   freeze user-sim model+prompt                   │
+                    │ SIDECAR: sample 0.1 after 30s idle               │
+                    │   HealthBench-shaped rubric (tone/completeness)  │
+                    │   spend cap; coverage% on the board              │
+                    └──────────────────┬───────────────────────────────┘
+                                       v
+                    ┌──────────────────────────────────────────────────┐
+                    │ Promote: redacted failing traces -> annotation   │
+                    │ queue (runs, not threads) -> tagged dataset      │
+                    │ Human on hard-vs-soft disagreement               │
+                    └──────────────────────────────────────────────────┘
+```
+
+**Technology choices:**
+- Hard oracle = final DB state (tau) + policy caps, **not** the NL claim. Freeze the user-sim (tau pass^k collapses when the sim upgrades).
+- `k=5` trials; gate on **pass^5** (or pass^3 if budget-constrained).
+- Tool unit on every commit (BFCL / DeepEval `ToolCorrectnessMetric` / Promptfoo `trajectory:tool-sequence` + irrelevance).
+- Online: Braintrust/LangSmith sampling 0.1, rubric **not** 1-5 vibe. CI exit: Promptfoo failures / LangSmith >= 0.85 / Braintrust `Reporter.reportRun`.
+- Miller: a 50-item set **cannot** support a 3 pp claim (n ~ 969). tau-retail-only golden set is wrong if the product is dual-control (tau GPT-4.1: retail 74%, airline 56%, telecom 34%).
+
+**Trade-off matrix:**
+
+| Axis | A1: Dual-oracle DB/policy hard + async rubric (recommended) | A2: Hard-only (DB match) | A3: Soft-only (LLM judge on utterance) |
+|---|---|---|---|
+| **Cost** | Agent x k + sampled judge; nightly 200-task ~$12 uncached / ~$48 at pass^5 | Agent x k; no judge line | Agent + judge x sample; cheapest and wrong |
+| **Latency** | User eval tax **0 ms**; sidecar time-to-score ~31.2s p50 with 30s idle | CI only; 0 ms user | 0 ms if async; **+12s p99** if inlined |
+| **Ops complexity** | Freeze sim; two dashboards (hard vs soft); coverage% | Env reset discipline only | Judge calibration + position swap |
+| **Security** | PII redact before promote/judge; sim MCP not Stripe; safety not averaged | Blind to tone/PII-in-utterance | Judge is a subprocessor on every sampled trace |
+| **Scalability** | `sampling_rate` + spend cap; n ~ 969 for 3 pp claim | Docker/DB snapshots x k | Judge TPM; spend cap with no backfill |
+
+**Decision.** A1 wins. Hard-only ships "correct but hostile" and misses PII-in-logs. Soft-only ships "pretty wrong" (ARE whole-trace judge precision 0.53). Dual-oracle costs more and that is the point: reliability eval is not a unit test.
+
+### Scenario B -- RAG Faithfulness CI + Citation Constraint
+
+**Problem.** A retrieval-grounded financial assistant must not hallucinate against retrieved context, and citations must be real IDs from the retrieved set. WikiEval's ~95% RAGAS faithfulness agreement is being proposed as the production SLO. A second team wants DeepEval `FaithfulnessMetric` defaults on the same board. Fine-tunes will land later and must not drop this suite.
+
+**Architecture:**
+
+```
+  ┌──────────────┐    ┌─────────────────────────────────────────────┐
+  │ Pinned       │───>│ CONTROL: dataset as_of + chunker/embed pin  │
+  │ RAG gold     │    │   retriever: context recall vs reference    │
+  │ (offline)    │    │              ID-based context precision     │
+  └──────────────┘    │   generator hard: RAGAS Faithfulness NLI    │
+                      │   citation: IDs in retrieved set (constrained│
+                      │             decode / tool-only cite)        │
+                      │   CI: DeepEval assert_test / Promptfoo      │
+                      │       fail merge on paired drop vs baseline │
+                      └──────────────────┬──────────────────────────┘
+                                         v
+                      ┌──────────────────────────────────────────────┐
+                      │ ONLINE 1-10%: Phoenix rails                  │
+                      │   {grounded, hallucinated} under             │
+                      │   suppress_tracing; never block the user     │
+                      │ Construct != world-fact (not SimpleQA)       │
+                      └──────────────────────────────────────────────┘
+```
+
+**Key decisions:**
+- Faithfulness = RAGAS claim-level **entailment** vs retrieved context, **or** DeepEval with `penalize_ambiguous_claims=True` -- pick one construct and name it on the dashboard.
+- Threshold from a **human-labeled** calibration set, not WikiEval 0.95 transplanted.
+- Citation check is **deterministic** (ID in retrieved set); RAGAS will not catch a bare invented `[doc 17]`.
+- Context recall is the complementary hard signal (faithfulness can be 1.0 on the wrong documents).
+- Answer relevancy (78% WikiEval) is **soft** -- do not ship-gate on it.
+- Online: reference-free only. A new adapter must pass this suite **and** a frozen general holdout; hosted OpenAI Evals cannot be that gate after **2026-11-30**.
+
+**Trade-off matrix:**
+
+| Axis | B1: RAGAS entailment + ID citation + context recall (recommended) | B2: DeepEval default Faithfulness | B3: Answer-relevancy / G-Eval vibe |
+|---|---|---|---|
+| **Cost** | NLI calls per claim; ID check is free; nightly envelope | Similar LLM cost; **false 1.0** on unsupported answers | Cheap; G-Eval flake (20 samples + token weights) |
+| **Ops** | Two metrics + citation unit; pin retriever version | One metric, wrong default | One number, contested construct |
+| **Security** | Judge sees redacted claims+chunks; no gold world-facts required online | Same egress | Verbosity bias (HealthBench length correlation) |
+| **Scalability** | Claim fan-out; sample online | Silent quality lie scales perfectly | Cannot catch retrieval miss or fake IDs |
+
+**Decision.** B1 wins. B2 is a known footgun (empty/idk gives 1.0). Faithfulness without context recall ships fluent lies about the wrong docs. Citations are a constraint problem, not an LLM-judge problem.
+
+### Scenario C -- Agent Deployment Quality Gate (Four-Dimensional)
+
+**Problem.** A SaaS company builds an AI agent handling customer billing (checking balances, applying credits, processing refunds). Before deploying a new version, they need a quality gate that blocks unsafe releases. The agent has access to financial tools where errors have direct monetary impact.
+
+**Architecture:**
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                    FOUR-DIMENSIONAL QUALITY GATE                   │
+│                                                                    │
+│  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐          │
+│  │  Dim 1:      │   │  Dim 2:      │   │  Dim 3:      │          │
+│  │  OUTCOME     │   │  TRAJECTORY  │   │  TOOL USE    │          │
+│  │              │   │              │   │              │          │
+│  │  Task SR     │   │  Geo-mean    │   │  Selection   │          │
+│  │  >= 85%      │   │  >= 3.5/5    │   │  acc >= 95%  │          │
+│  │  on 200-task │   │  (LLM judge) │   │  Arg correct │          │
+│  │  internal    │   │              │   │  >= 90%      │          │
+│  │  eval        │   │              │   │  Repeat < 5% │          │
+│  └──────┬───────┘   └──────┬───────┘   └──────┬───────┘          │
+│         v                  v                   v                  │
+│  ┌─────────────────────────────────────────────────────────┐      │
+│  │                   GATE LOGIC                             │      │
+│  │  Block deploy if ANY dimension regresses > 5%           │      │
+│  │  from baseline (absorbs LLM non-determinism)            │      │
+│  └────────────────────────┬────────────────────────────────┘      │
+│                           v                                       │
+│  ┌────────────────────────────────────────────────────────────┐   │
+│  │  Dim 4: COST + LATENCY                                     │   │
+│  │  Per-task $ within 2x of baseline; p95 latency < 30s      │   │
+│  └────────────────────────────────────────────────────────────┘   │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+**Key decisions:**
+- Internal 200-task suite (not public benchmarks -- reward hacking risk).
+- Geometric mean for trajectory (one bad refund step must not vanish in arithmetic mean).
+- 5% regression tolerance absorbs LLM non-determinism while catching real regressions.
+- Four dimensions ensure no single metric masks a failure: outcome alone misses unsafe trajectories, trajectory alone misses tool misuse, tool accuracy alone misses goal failure, cost prevents runaway loops.
+- Real-time tool verification during eval (not post-hoc log analysis) because financial tools require immediate detection.
+
+---
+
+## Common Failure Modes
+
+| # | Failure | Cause | Detection | Mitigation |
+|---|---|---|---|---|
+| 1 | **"The model scored 91%"** | Collapsed M x H x T x E x O x n x r x I into one number | Cannot name scaffold/image/RAM/grader version | Pin the product tuple; < 3 pp without it is not a result |
+| 2 | **pass@1 quoted as SLO** | Demo used best-of-N / hidden retries | pass^k gap (up to 24.9 pp) | Report both; cap retries in target; Inspect epochs |
+| 3 | **Sync judge on user p99** | Second LLM call in the request handler | User p99 = judge p99 (+12s); judge 429 becomes user 500 | Async sidecar; 0 ms eval tax |
+| 4 | **Gold-NLI applied to prod traces** | Offline construct used online | Metric undefined (no gold reference) | Reference-free online; gold only in CI |
+| 5 | **Composite hides safety** | Average faithfulness+tone+PII | Safety 0.70 buried in "quality 0.93" | Dual-oracle; safety not in the mean |
+| 6 | **Grader crash = agent fail** | OpenAI exception sets score to 0 | Infra errors in pass@1 count | `grader_status`; Inspect NaN when n < k |
+| 7 | **DeepEval faithfulness 1.0** | "idk" / empty verdicts pass by default | Calibration vs RAGAS entailment | `penalize_ambiguous_claims=True` or use RAGAS |
+| 8 | **Reused SWE run_id** | Cache key ignores patch hash | Zero new measurement | New `run_id`; don't VCR agent calls |
+| 9 | **Trial-2 inherits booking** | No environment reset between trials | Inflated pass^k | Snapshot per trial; separate cache keys |
+| 10 | **Spend cap paints green** | Skipped runs not backfilled | Coverage% missing on dashboard | Coverage NFR; `score IS NOT NULL` alerts |
+| 11 | **Promoted PII becomes immortal** | Trace added to dataset before redacting | GDPR erasure vs 14d TTL conflict | Detect -> redact -> audit **before** ingest |
+| 12 | **Public Verified as hiring bar** | Contamination / gold regurgitation | OpenAI stopped reporting scores | Private holdout; rolling post-cutoff tickets |
+| 13 | **3 pp claim on 50 items** | CLT on tiny n | Miller: n ~ 969 for 3 pp MDE | Bootstrap; power analysis; paired SE |
+| 14 | **Lucky pass ships** | Outcome-only gate | AgentLens 10.7% lucky passes | Process overlay; forbidden-action counts |
+| 15 | **Hosted Evals CI after cutoff** | Deprecated control plane | Hard outage 2026-11-30 | Migrate to Promptfoo/Inspect before read-only 2026-10-31 |
+| 16 | **Uncalibrated judge drift** | Judge not recalibrated quarterly | Perfect dashboards diverging from expert review | Monthly kappa checks; recalibrate when kappa < 0.60 |
+| 17 | **Benchmark reward hacking** | Agent exploits eval harness, not tasks | UC Berkeley broke 8 benchmarks (April 2026) | Internal private evals from actual product |
+
+---
+
+## Interview Q&A
+
+**Q1. What is an eval system, in one minute?**
+I treat eval as a measurement system, not a screenshot. Three planes: a control-plane harness that runs a pinned dataset into an immutable experiment, a data-plane tracer on the user SLO clock, and an async judge sidecar that must not sit on user p99. Dual-oracle: a hard correctness/safety bit plus a soft rubric. I refuse to quote "the model scored 91%" without naming the scaffold, tools, environment image, retries, and grader version -- Anthropic showed infra alone is 6 pp on Terminal-Bench.
+
+**Q2. pass@k vs pass^k -- which is the SLO?**
+pass@k (Chen) is the probability at least one of k samples works, and only if I have a verifier to pick it -- HumanEval unit tests, not an LLM judge. pass^k (tau-bench) is the probability all k trials work; that is reliability. Original retail pass^8 was under 25%. Anthropic's think-tool moved tau-airline pass^1 from 0.332 to 0.584 but pass^5 only from 0.100 to 0.340. Users get one try, so I gate on pass^k and report pass@k as a capability envelope. Mixing them up is how a demo becomes an SLO.
+
+**Q3. Why not put GPT-4-as-judge on every request?**
+Because that is a latency tax and a subprocessor egress, not an eval system. Braintrust, LangSmith, and Datadog all score after the root span. My user-path eval tax is 0 ms. Sidecar time-to-score with a 30s idle plus a 2k/200 judge is about 31.2s p50 -- late scores, not a slow chat. Zheng still has position, verbosity, and self-enhancement bias; few-shot raised GPT-4 swap consistency 65 to 77.5% at 4x cost without lifting human agreement. If a JSON schema or DB state exists, I use that first.
+
+**Q4. Give me the cost model for 1,000 eval tasks.**
+I state the mix. Judge-only 2k in / 200 out at Sonnet $3/$15 is about $9 per 1k. LangSmith extended experiments are $5 per 1k platform. Braintrust Pro on-demand scores are $1.50 per 1k. A tau-like 8k/1.5k agent with 70% cache read on a 6k prefix is about $26 per 1k agent; add judge and extended traces and I am near $40. pass^4 multiplies agent+sim by about four. Human annotation has no fixed SKU -- I will not invent one. HealthBench is 55k grader calls per model; that judge line is not rounding error.
+
+**Q5. What p99 do you put in the contract?**
+I do not quote a vendor online-judge p99 -- nobody publishes theirs. I contract 0 ms eval tax on the user path, and I SLO the sidecar separately: about 20/80/250 ms for a local deterministic oracle, 1,200/4,000/12,000 ms for judge compute, 31,200/34,000/42,000 ms time-to-score including Braintrust's 30s idle. p99 of a 50-example experiment is noise. If someone inlines the judge, they buy +12s on user p99 and judge 429s become user 500s.
+
+**Q6. Dual-oracle for a refund agent -- walk the gate.**
+CI fail-closed: tau-style simulator, frozen user-sim, DB goal-state plus policy caps, k=5, gate on pass^5, infra errors in a separate bucket. Every commit: schema/AST tool unit including abstention. Soft rubric (tone, completeness) is async sampled and never overrides a hard fail. Online fail-open with coverage%. I will not average PII/safety into a 0.93 quality score. A 50-item set cannot detect a 3 pp move -- Miller's worked example is n ~ 969.
+
+**Q7. RAG faithfulness looked like 1.0 and users still complained.**
+Two footguns. RAGAS faithfulness is entailment vs retrieved context, not world truth -- you can be perfectly faithful to the wrong docs, so I pair it with context recall and I do not ship-gate on answer relevancy (78% WikiEval). DeepEval's default Faithfulness treats "idk" as yes and empty verdicts as 1.0 unless I set `penalize_ambiguous_claims`. Citations are a third construct: I constrain IDs to the retrieved set because RAGAS will not catch a bare invented `[doc 17]`. I calibrate the threshold on our humans, not WikiEval's 0.95.
+
+**Q8. Our SWE eval did not move after a patch change. What happened?**
+SWE-bench caches on (run_id, instance_id), not the patch hash. Reusing run_id is a silent no-op. I mint a new run_id, keep --cache_level=env, and I do not commit LangSmith VCR cassettes for agent calls if I intend to re-measure. I also bucket harness crashes separately from unresolved. If we were quoting public Verified, I would refuse -- OpenAI stopped reporting it because models regurgitate gold patches; Pro then climbed 23.3% to 80.3% in eight months and roughly 30% of tests were broken.
+
+**Q9. Temperature 0, still plus/minus 2 pp. Are we sloppy?**
+The Randomness paper: SD still exceeds 1.5 pp at T=0; single-run pass@1 ranges 2.2-6.0 pp; trajectories diverge in the first roughly 1% of tokens. That is aleatoric plus engine/env nondeterminism. I estimate pass@1 from multiple independent runs, report pass@k and pass^k, and I treat a 31% to 33% single-run "win" as noise. Silent agent retries on top of that are an undeclared pass@k and a double-refund risk in prod.
+
+**Q10. Trace to golden set. Where do people get sued?**
+Promotion is a retention-class change: a 14-day debug email becomes immortal. I run detect, redact, audit before ingest -- LangSmith anonymizer/hide flags, OpenInference HIDE_*, Braintrust mask. Hide-all makes offline eval impossible, so I tokenize and keep structure. The judge sees already-redacted text or I have a second subprocessor agreement. Annotation-queue edits are the same RBAC as dataset write. PCI cardholder data does not go to LangSmith at all. Who changed goldens: dataset versions + git of the suite; I log evaluator_version on every score.
+
+**Q11. How do you keep the judge from becoming the reward?**
+Code assertions first (Hamel's rule: at least 100 traces, build a taxonomy, stop when 20 add no category). Itemized weighted criteria, not a 1-5 vibe. Position swap and treat flips as ties. Different model family only if calibration improves. HealthBench kept GPT-4.1 over o3 as grader because meta-eval F1 was higher and cheaper -- reasoning models are not automatically better judges. I never use a judge where math/code/JSON can be checked deterministically. If that judge is also the RL reward, the policy will farm length and sycophancy.
+
+**Q12. LLM-as-judge biases -- name them and fix them.**
+Five documented biases. Position bias: GPT-4 flipped preference on a third of pairwise cases, fix with both-order evaluation and neutral labels. Length bias: judges rate longer answers higher regardless of correctness, fix with explicit rubric instruction that concise equals verbose at equivalent quality. Self-preference: models rate own-style output higher by 10-25%, fix with cross-family judging. Rubric position bias (2026): reordering criteria options shifts scores, fix with randomized ordering. Compounding (FairJudge, Feb 2026): frontier models exceeded 50% error rates on bias tests, fix with SFT+DPO+GRPO debiasing pipeline.
+
+**Q13. How do you build an internal private eval suite?**
+I start with 50-200 representative tasks from actual product usage, not public benchmarks. I version the dataset in git alongside code, use content-addressable storage so score changes are attributable to code changes not dataset drift. I include slices for each product vertical (tau showed retail 74% but telecom only 34% on the same model). I protect the holdout -- never expose test cases to the training pipeline. I refresh quarterly with post-cutoff production failures. And I run power analysis before claiming improvements: n ~ 969 for a 3 pp MDE, so I do not pretend a 50-item set can detect small regressions.
+
+---
+
+## Key Numbers to Memorize
+
+### Estimators and Statistics
+
+| Number | What |
+|---|---|
+| **Chen product; naive 1-(1-p)^k biased** | pass@k unbiased estimator |
+| **C(c,k) / C(n,k)** | Inspect pass^k (without replacement) |
+| **NaN when n < k** | Correct behavior (Inspect), not a bug |
+| **164 / n=200 / 7.7 tests** | HumanEval original |
+| **80x tests / 19.3-28.9% drop** | HumanEval+ additions / pass@k impact |
+| **2.2-6.0 pp / >1.5 pp at T=0** | Single-run pass@1 range; T=0 standard deviation |
+| **24.9 pp** | Maximum pass@k vs pass^k gap observed |
+| **n ~ 969** | Miller 3 pp MDE sample size |
+| **13.2% to 7.5% MDE** | K=1 to K=10 retries on n=198 |
+| **unit = task, not step** | CLT fails below few hundred tasks |
+
+### Benchmarks and Reliability
+
+| Number | What |
+|---|---|
+| **0.332 to 0.584 / 0.100 to 0.340** | tau-airline think+prompt pass^1 / pass^5 |
+| **0.812 / 0.626** | tau-retail Think pass^1 / pass^5 |
+| **< 50% / pass^8 < 25%** | tau GPT-4o-class pass^1 / retail pass^8 |
+| **74% / 56% / 34%** | tau GPT-4.1 retail / airline / telecom pass^1 |
+| **6 pp** | Terminal-Bench infra-only score difference |
+| **+64% relative (12.47%)** | SWE-agent ACI vs shell, same GPT-4 Turbo |
+| **10.7% (0.5-23.2%)** | AgentLens lucky passes |
+| **92% vs 15%** | GAIA human vs GPT-4+plugins |
+| **8 pp** | GSM1k vs GSM8k contamination gap |
+| **23.3% to 80.3% / ~30% broken** | SWE-Pro public split; retracted audit |
+
+### Oracles, Judges, and Metrics
+
+| Number | What |
+|---|---|
+| **0.98 vs 0.72 / 0.99 vs 0.53** | ARE verifier vs whole-trace judge agreement/precision |
+| **> 80% / 65 to 77.5% at 4x** | Zheng GPT-4 vs humans; few-shot consistency |
+| **~95% / 78% / 70%** | RAGAS WikiEval faithfulness / answer / context relevance |
+| **0.514** | G-Eval GPT-4 Spearman avg (SummEval) |
+| **0.709 / 55-75% / median 11** | HealthBench grader F1 / MD-MD agreement / criteria per example |
+| **48,562 / 5,000** | HealthBench unique criteria / conversations |
+| **~60% / 32% / 16%** | HealthBench o3 / GPT-4o / GPT-3.5 Turbo |
+| **+10% / +25%** | GPT-4 / Claude-v1 self-enhancement bias |
+| **> 50% error rate** | FairJudge: frontier models on bias tests (Feb 2026) |
+| **0.5** | RAGAS faithfulness walkthrough (Einstein example) |
+
+### Cost and Platforms
+
+| Number | What |
+|---|---|
+| **$9 per 1k judge calls** | Sonnet 2k/200 (uncached) |
+| **~$1.10 per 1k** | Sonnet with cached prefix input |
+| **~$26 per 1k tasks** | tau-like agent execution |
+| **~$40 per 1k tasks** | Agent + judge + LangSmith extended |
+| **~$48 per 1k tasks** | pass^5 agent multiplier |
+| **~$12 nightly** | 200-task uncached envelope |
+| **$5 / $0.50 per 1k** | LangSmith extended / base traces |
+| **$1.50 per 1k** | Braintrust Pro on-demand scores |
+| **$39 / $249 / $160** | LS Plus seat / BT Pro seat / DD 100k LLM spans |
+| **55,000** | HealthBench grader calls per model |
+| **$11.36 vs $180.49** | HAL tau-airline o4-mini High vs Opus 4.1 |
+
+### Latency, Throughput, and Dates
+
+| Number | What |
+|---|---|
+| **0 / 0 / 0 ms** | User-path eval tax (non-negotiable) |
+| **20 / 80 / 250 ms** | Deterministic oracle sidecar p50/p95/p99 |
+| **1,200 / 4,000 / 12,000 ms** | LLM judge compute p50/p95/p99 |
+| **31,200 / 34,000 / 42,000 ms** | Time-to-score with 30s idle + judge |
+| **25,000** | LangSmith max runs per trace |
+| **50k/500 MB; 500k/5 GB per hour** | LS Developer / Plus ingest limits |
+| **10,000 executions / 10s** | Braintrust function execution limit |
+| **2026-10-31 / 2026-11-30** | OpenAI Evals read-only / shutdown |
+| **Monday 00:00 UTC** | LangSmith evaluator spend-cap reset |
+
+---
+
+## Quick Reference
+
+| Concept | One-Line Summary |
+|---|---|
+| **Eval = measurement system** | Harness + env + tools + judge + retries + infra, not a leaderboard |
+| **Three planes** | Control (batch harness), Data (user traffic), Judge (async sidecar) |
+| **Two clocks** | Eval clock (async, batch) vs user clock (real-time, 0 ms tax) |
+| **Dual oracle** | Hard (deterministic) + soft (rubric); hard fail skips soft |
+| **pass@k** | At-least-one-of-k; Chen product; needs verifier; capability envelope |
+| **pass^k** | All-k-succeed; reliability; what users experience; gate on this |
+| **NaN when n < k** | Correct Inspect behavior; do not extrapolate |
+| **Geometric mean** | Trajectory scoring; punishes single bad step unlike arithmetic |
+| **Layered scoring** | Deterministic (ms) -> heuristic (cheap) -> LLM judge (expensive) |
+| **Position swap** | Evaluate both orderings in pairwise; only count consistent verdicts |
+| **RAGAS faithfulness** | Entailment vs retrieved context, NOT world truth |
+| **Context recall** | Complement to faithfulness -- catches faithful-to-wrong-docs |
+| **Citation = constraint** | Deterministic ID check, not LLM judge problem |
+| **Coverage%** | Unscored != passed; alert on `score IS NULL` |
+| **PII pipeline** | Detect -> redact -> audit BEFORE ingest into dataset/judge |
+| **Fail-open online** | Breaker open => skip score, never block user |
+| **Fail-closed CI** | Breaker open => error, never pass silently |
+| **n ~ 969** | Minimum for 3 pp MDE; 50-item sets cannot detect small regressions |
+| **run_key** | Includes harness commit; scaffold change = new measurement |
+| **Hosted Evals death** | OpenAI Evals shutdown 2026-11-30; migrate before 2026-10-31 |

@@ -1,792 +1,853 @@
 """
-Module 02: Fine-Tuning LLMs (SFT / PEFT / Preference / RLVR) -- Code Examples
-
-Extracted from 02-fine-tuning.md. Contains two complete production fine-tuning
-pipeline implementations:
-
-  A. Adapter Registry, Canary Controller, and Fallback Chain (Opus-style)
-     - Evaluation gating (4-gate: task, forgetting, safety, serve-dtype)
-     - Adapter version management with immutable registry
-     - Canary deployment controller with auto-rollback
-     - Fallback inference chain with circuit breakers
-     - Structured logging with structlog
-
-  B. Control Plane + Serve Runtime with Full Jitter, Authz, Lineage (Grok-style)
-     - Idempotent job submission keyed by dataset+base+peft+seed+code SHA
-     - TransientError/PermanentError distinction
-     - Protocol-based generator swapping
-     - Fallback: FT adapter -> base model -> deterministic schema
-     - Per-dependency circuit breakers (train API, adapter serve, base serve)
-     - JSON logs with correlation_id + tenant + job on every line
-
-Key patterns demonstrated across both implementations:
-  - Training is a write/control plane; serving is a read/data plane
-  - Eval gate is a hard block before promotion
-  - Adapter rollback is a pointer flip (tens of MB)
-  - Circuit breakers are independent per dependency
-  - Identity from verified token, NEVER from model JSON
-"""
-
-
-# --- Section: Production Code A: Adapter Registry, Canary Controller, and Fallback Chain (Opus) ---
-
-"""
-Production fine-tuning pipeline with resilience patterns.
-Demonstrates: training with checkpointing and spot resilience,
-evaluation gating, adapter versioning, canary deployment with
-rollback, circuit breakers, and structured logging.
-"""
-
-import hashlib
-import json
-import logging
-import random
-import time
-import uuid
-from dataclasses import dataclass, field
-from enum import Enum
-from pathlib import Path
-from typing import Any, Optional
-
-import structlog
-
-logger = structlog.get_logger()
-
-
-def correlation_id() -> str:
-    return str(uuid.uuid4())[:12]
-
-
-# --- Circuit Breaker ---
-
-class CircuitState(Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
-
-
-@dataclass
-class CircuitBreaker:
-    name: str
-    failure_threshold: int = 5
-    recovery_timeout: float = 60.0
-    half_open_max_calls: int = 2
-    state: CircuitState = field(default=CircuitState.CLOSED, init=False)
-    failure_count: int = field(default=0, init=False)
-    last_failure_time: float = field(default=0.0, init=False)
-    half_open_calls: int = field(default=0, init=False)
-
-    def can_execute(self) -> bool:
-        if self.state == CircuitState.CLOSED:
-            return True
-        if self.state == CircuitState.OPEN:
-            if time.time() - self.last_failure_time >= self.recovery_timeout:
-                self.state = CircuitState.HALF_OPEN
-                self.half_open_calls = 0
-                return True
-            return False
-        return self.half_open_calls < self.half_open_max_calls
-
-    def record_success(self) -> None:
-        if self.state == CircuitState.HALF_OPEN:
-            self.half_open_calls += 1
-            if self.half_open_calls >= self.half_open_max_calls:
-                self.state = CircuitState.CLOSED
-                self.failure_count = 0
-        else:
-            self.failure_count = 0
-
-    def record_failure(self) -> None:
-        self.failure_count += 1
-        self.last_failure_time = time.time()
-        if self.state == CircuitState.HALF_OPEN:
-            self.state = CircuitState.OPEN
-        elif self.failure_count >= self.failure_threshold:
-            self.state = CircuitState.OPEN
-
-
-# --- Retry with Backoff + Jitter ---
-
-def retry_with_backoff(
-    func,
-    max_retries: int = 3,
-    base_delay: float = 1.0,
-    max_delay: float = 30.0,
-    retryable: tuple = (ConnectionError, TimeoutError, OSError),
-    cid: str = "",
-):
-    for attempt in range(max_retries + 1):
-        try:
-            result = func()
-            if attempt > 0:
-                logger.info("retry.succeeded", attempt=attempt, cid=cid)
-            return result
-        except retryable as e:
-            if attempt == max_retries:
-                logger.error("retry.exhausted", attempts=max_retries + 1, error=str(e), cid=cid)
-                raise
-            delay = random.uniform(0, min(base_delay * (2 ** attempt), max_delay))
-            logger.warning("retry.backoff", attempt=attempt + 1, delay_s=round(delay, 2), cid=cid)
-            time.sleep(delay)
-
-
-# --- Evaluation Gate ---
-
-@dataclass
-class EvalThresholds:
-    """Minimum scores to pass the evaluation gate."""
-    task_accuracy: float = 0.85
-    mmlu_floor: float = 0.60       # general capability floor
-    hellaswag_floor: float = 0.70  # commonsense floor
-    safety_pass_rate: float = 0.95  # red-team resistance
-
-
-@dataclass
-class EvalResult:
-    task_accuracy: float
-    mmlu_score: float
-    hellaswag_score: float
-    safety_pass_rate: float
-    forgetting_delta_mmlu: float   # change from base model score
-    forgetting_delta_hellaswag: float
-
-    def passes(self, thresholds: EvalThresholds) -> bool:
-        return (
-            self.task_accuracy >= thresholds.task_accuracy
-            and self.mmlu_score >= thresholds.mmlu_floor
-            and self.hellaswag_score >= thresholds.hellaswag_floor
-            and self.safety_pass_rate >= thresholds.safety_pass_rate
-        )
-
-    @property
-    def forgetting_alert(self) -> bool:
-        """Alert if general capability dropped significantly."""
-        return (
-            self.forgetting_delta_mmlu < -0.05
-            or self.forgetting_delta_hellaswag < -0.05
-        )
-
-
-# --- Adapter Version Management ---
-
-@dataclass
-class AdapterVersion:
-    version_id: str
-    base_model: str
-    adapter_path: str
-    training_config: dict
-    eval_result: EvalResult
-    signature: str   # SHA-256 of adapter weights
-    created_at: float
-    promoted: bool = False
-
-
-class AdapterRegistry:
-    """Immutable adapter registry with promotion and rollback."""
-
-    def __init__(self):
-        self._versions: dict[str, AdapterVersion] = {}
-        self._production_version: Optional[str] = None
-        self._previous_production: Optional[str] = None
-
-    def register(self, version: AdapterVersion, cid: str = "") -> None:
-        if version.version_id in self._versions:
-            raise ValueError(f"Version {version.version_id} already exists (immutable)")
-        self._versions[version.version_id] = version
-        logger.info(
-            "adapter.registered",
-            version=version.version_id,
-            task_acc=version.eval_result.task_accuracy,
-            mmlu=version.eval_result.mmlu_score,
-            cid=cid,
-        )
-
-    def promote(
-        self,
-        version_id: str,
-        thresholds: EvalThresholds,
-        cid: str = "",
-    ) -> bool:
-        version = self._versions.get(version_id)
-        if not version:
-            raise KeyError(f"Version {version_id} not found")
-
-        if not version.eval_result.passes(thresholds):
-            logger.warning(
-                "adapter.promotion_rejected",
-                version=version_id,
-                reason="eval_below_threshold",
-                cid=cid,
-            )
-            return False
-
-        if version.eval_result.forgetting_alert:
-            logger.warning(
-                "adapter.forgetting_detected",
-                version=version_id,
-                mmlu_delta=version.eval_result.forgetting_delta_mmlu,
-                hellaswag_delta=version.eval_result.forgetting_delta_hellaswag,
-                cid=cid,
-            )
-
-        self._previous_production = self._production_version
-        self._production_version = version_id
-        version.promoted = True
-        logger.info("adapter.promoted", version=version_id, cid=cid)
-        return True
-
-    def rollback(self, cid: str = "") -> Optional[str]:
-        if not self._previous_production:
-            logger.error("adapter.rollback_failed", reason="no_previous_version", cid=cid)
-            return None
-        rolled_back_from = self._production_version
-        self._production_version = self._previous_production
-        self._previous_production = None
-        logger.info(
-            "adapter.rolled_back",
-            from_version=rolled_back_from,
-            to_version=self._production_version,
-            cid=cid,
-        )
-        return self._production_version
-
-    @property
-    def production_version(self) -> Optional[str]:
-        return self._production_version
-
-
-# --- Canary Deployment Controller ---
-
-@dataclass
-class CanaryConfig:
-    initial_traffic_pct: float = 5.0
-    ramp_step_pct: float = 10.0
-    ramp_interval_seconds: float = 3600.0  # 1 hour between ramps
-    quality_threshold: float = 0.85
-    rollback_on_degradation: bool = True
-
-
-class CanaryController:
-    """
-    Routes traffic between production and canary adapter.
-    Monitors quality. Auto-rollback on degradation.
-    """
-
-    def __init__(
-        self,
-        registry: AdapterRegistry,
-        config: CanaryConfig,
-        quality_monitor,  # callable(version_id) -> float
-    ):
-        self.registry = registry
-        self.config = config
-        self.quality_monitor = quality_monitor
-        self.canary_version: Optional[str] = None
-        self.canary_traffic_pct: float = 0.0
-        self.last_ramp_time: float = 0.0
-
-    def start_canary(self, version_id: str, cid: str = "") -> None:
-        self.canary_version = version_id
-        self.canary_traffic_pct = self.config.initial_traffic_pct
-        self.last_ramp_time = time.time()
-        logger.info(
-            "canary.started",
-            version=version_id,
-            traffic_pct=self.canary_traffic_pct,
-            cid=cid,
-        )
-
-    def route_request(self) -> str:
-        """Returns version_id to serve this request."""
-        if self.canary_version and random.random() * 100 < self.canary_traffic_pct:
-            return self.canary_version
-        return self.registry.production_version or "base"
-
-    def check_and_ramp(self, cid: str = "") -> None:
-        if not self.canary_version:
-            return
-
-        quality = self.quality_monitor(self.canary_version)
-
-        if quality < self.config.quality_threshold:
-            logger.warning(
-                "canary.quality_degraded",
-                version=self.canary_version,
-                quality=quality,
-                threshold=self.config.quality_threshold,
-                cid=cid,
-            )
-            if self.config.rollback_on_degradation:
-                self.canary_version = None
-                self.canary_traffic_pct = 0.0
-                logger.info("canary.rolled_back", cid=cid)
-            return
-
-        elapsed = time.time() - self.last_ramp_time
-        if elapsed >= self.config.ramp_interval_seconds:
-            self.canary_traffic_pct = min(
-                100.0, self.canary_traffic_pct + self.config.ramp_step_pct
-            )
-            self.last_ramp_time = time.time()
-            logger.info(
-                "canary.ramped",
-                version=self.canary_version,
-                traffic_pct=self.canary_traffic_pct,
-                cid=cid,
-            )
-
-            if self.canary_traffic_pct >= 100.0:
-                self.registry.promote(
-                    self.canary_version, EvalThresholds(), cid=cid
-                )
-                self.canary_version = None
-                logger.info("canary.completed_full_rollout", cid=cid)
-
-
-# --- Fallback Inference Chain ---
-
-class FallbackInferenceChain:
-    """
-    Try fine-tuned model -> base model with prompt -> cached response.
-    Each provider protected by a circuit breaker.
-    """
-
-    def __init__(self, providers: list[tuple[str, Any, CircuitBreaker]]):
-        self.providers = providers  # (name, inference_fn, circuit_breaker)
-
-    def generate(self, prompt: str, cid: str = "") -> dict:
-        errors = []
-        for name, inference_fn, cb in self.providers:
-            if not cb.can_execute():
-                errors.append((name, "circuit_open"))
-                continue
-            try:
-                def _call():
-                    return inference_fn(prompt)
-
-                result = retry_with_backoff(_call, max_retries=2, cid=cid)
-                cb.record_success()
-                return {
-                    "text": result,
-                    "provider": name,
-                    "fallback": name != self.providers[0][0],
-                }
-            except Exception as e:
-                cb.record_failure()
-                errors.append((name, str(e)))
-                logger.warning("fallback.failed", provider=name, error=str(e), cid=cid)
-
-        raise RuntimeError(f"All inference providers failed: {errors}")
-
-
-# --- Section: Production Code B: Control Plane + Serve Runtime with Full Jitter, Authz, Lineage (Grok) ---
-
-#!/usr/bin/env python3
-"""Fine-tune control+serve resilience: retries, breakers, adapter->base->deterministic.
-
-Stdlib only. Swap Fake* ports for vendor HTTP (OpenAI jobs, vLLM /v1/load_lora_adapter).
+Fine-Tuning LLMs -- Interview Prep Code Snippets.
+
+Covers SFT data preparation (JSONL chat format), LoRA/QLoRA configuration
+and math, training loops with validation, DPO preference data format,
+a decision function (RAG vs fine-tune vs prompt), and evaluation gates
+for before/after fine-tuning comparison.
 """
 from __future__ import annotations
 
 import hashlib
 import json
-import logging
-import random
+import math
 import time
-import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Protocol
-
-# Optional deps (not required to run this file):
-#   import httpx  # vendor job + vLLM client
-#   from peft import PeftModel  # local adapter load; merge_and_unload() MUST be assigned
+from typing import Optional
 
 
-class CorrelationFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        record.correlation_id = getattr(record, "correlation_id", "-")
-        record.tenant_id = getattr(record, "tenant_id", "-")
-        record.job_id = getattr(record, "job_id", "-")
-        return True
+# --- Data Preparation: SFT JSONL Format ---
+
+def create_sft_example(
+    system: str,
+    user: str,
+    assistant: str,
+    metadata: Optional[dict] = None,
+) -> dict:
+    """Create a single SFT training example in OpenAI chat-completions format.
+
+    This is the standard format for vendor fine-tuning (OpenAI, Fireworks, Together)
+    and HuggingFace TRL SFTTrainer.
+
+    LIMA showed 1,000 carefully curated examples can rival 50k+ noisy ones.
+    InstructGPT: ~13k SFT demonstrations + ~33k RLHF comparisons beat a 100x-larger
+    unaligned model.
+
+    Key: quality > quantity. Dedup, PII-redact, and validate format before training.
+    """
+    return {
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+            {"role": "assistant", "content": assistant},
+        ],
+        **({"metadata": metadata} if metadata else {}),
+    }
 
 
-def configure_logging() -> logging.Logger:
-    logger = logging.getLogger("ft")
-    if logger.handlers:
-        return logger
-    handler = logging.StreamHandler()
-    handler.setFormatter(
-        logging.Formatter(
-            '{"ts":"%(asctime)s","level":"%(levelname)s",'
-            '"cid":"%(correlation_id)s","tenant":"%(tenant_id)s",'
-            '"job":"%(job_id)s","msg":"%(message)s"}'
-        )
-    )
-    handler.addFilter(CorrelationFilter())
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    return logger
+def validate_sft_dataset(examples: list[dict]) -> dict:
+    """Validate an SFT dataset for common issues.
 
+    Checks: required fields, role ordering, deduplication, length bounds.
+    Azure practical minimum: 50 examples. Hard minimum: 10.
 
-LOG = configure_logging()
+    Returns a quality report -- training should not proceed if format_errors > 0
+    or quality_score < 0.8.
+    """
+    seen_hashes = set()
+    dupes = 0
+    format_errors = 0
+    too_short = 0
+    too_long = 0
 
+    for ex in examples:
+        # Check required structure
+        if not isinstance(ex.get("messages"), list):
+            format_errors += 1
+            continue
 
-def slog(
-    level: int,
-    msg: str,
-    *,
-    cid: str,
-    tenant: str,
-    job: str = "-",
-    **fields: object,
-) -> None:
-    extra = {"correlation_id": cid, "tenant_id": tenant, "job_id": job}
-    LOG.log(level, "%s %s", msg, json.dumps(fields, default=str), extra=extra)
+        roles = [m.get("role") for m in ex["messages"]]
 
+        # Must have at least user + assistant
+        if "user" not in roles or "assistant" not in roles:
+            format_errors += 1
+            continue
 
-class TransientError(Exception):
-    """429, 5xx, preemption, adapter swap timeout -- safe to retry idempotent ops."""
-
-
-class PermanentError(Exception):
-    """4xx auth, rank>max_lora_rank, cutoff org, poison config hash -- do not retry."""
-
-
-def retry_with_jitter(
-    fn: Callable[[], object],
-    *,
-    cid: str,
-    tenant: str,
-    op: str,
-    job: str = "-",
-    attempts: int = 4,
-    base_s: float = 0.05,
-    cap_s: float = 2.0,
-) -> object:
-    """Retry with full jitter (AWS-style). Distinguishes transient vs permanent errors."""
-    last: Exception | None = None
-    for i in range(attempts):
-        try:
-            return fn()
-        except PermanentError:
-            raise
-        except TransientError as exc:
-            last = exc
-            if i == attempts - 1:
+        # Check role ordering: system (optional) -> user -> assistant -> ...
+        for msg in ex["messages"]:
+            if not msg.get("content", "").strip():
+                format_errors += 1
                 break
-            sleep = min(cap_s, base_s * (2**i))
-            sleep = random.uniform(0, sleep)  # full jitter
-            slog(
-                logging.WARNING, "retry",
-                cid=cid, tenant=tenant, job=job, op=op,
-                attempt=i + 1, sleep_s=round(sleep, 3), err=str(exc),
-            )
-            time.sleep(sleep)
-    assert last is not None
-    raise last
+
+        # Length checks (approximate token count as words / 0.75)
+        total_words = sum(len(m.get("content", "").split()) for m in ex["messages"])
+        approx_tokens = int(total_words / 0.75)
+        if approx_tokens < 10:
+            too_short += 1
+        if approx_tokens > 8192:
+            too_long += 1
+
+        # Dedup by content hash
+        h = hashlib.sha256(
+            json.dumps(ex["messages"], sort_keys=True).encode()
+        ).hexdigest()
+        if h in seen_hashes:
+            dupes += 1
+        seen_hashes.add(h)
+
+    valid = len(examples) - format_errors - dupes
+    quality = valid / max(len(examples), 1)
+
+    return {
+        "total_examples": len(examples),
+        "valid_examples": valid,
+        "format_errors": format_errors,
+        "duplicates": dupes,
+        "too_short": too_short,
+        "too_long": too_long,
+        "quality_score": round(quality, 3),
+        "ready_for_training": format_errors == 0 and quality >= 0.8 and len(examples) >= 50,
+    }
 
 
-class CircuitState_B(str, Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
+def write_jsonl(examples: list[dict], path: str):
+    """Write examples to JSONL file (one JSON object per line)."""
+    with open(path, "w") as f:
+        for ex in examples:
+            f.write(json.dumps(ex) + "\n")
 
 
-class CircuitOpenError(TransientError):
-    pass
+def prepare_classification_dataset(
+    emails: list[dict],
+    categories: list[str],
+    system_prompt: str = "Classify the email into one of these categories.",
+) -> list[dict]:
+    """Prepare an email classification dataset for SFT.
 
+    Scenario B from the module: classify 50k emails/day into 15 categories.
+    Fine-tuned gpt-4.1-mini achieves 96-98% accuracy vs 93-95% with prompting,
+    and cuts inference cost from $6,000/mo to $1,200/mo (5x savings).
 
-@dataclass
-class CircuitBreaker_B:
-    """Independent circuit breaker for train API, adapter serve, and base serve."""
-    name: str
-    failure_threshold: int = 5
-    cooldown_s: float = 15.0
-    half_open_probes: int = 1
-    _state: CircuitState_B = CircuitState_B.CLOSED
-    _failures: int = 0
-    _opened_at: float = 0.0
-    _probes_used: int = 0
-
-    def allow(self) -> None:
-        now = time.monotonic()
-        if self._state is CircuitState_B.OPEN:
-            if now - self._opened_at >= self.cooldown_s:
-                self._state = CircuitState_B.HALF_OPEN
-                self._probes_used = 0
-            else:
-                raise CircuitOpenError(f"circuit_open:{self.name}")
-        if self._state is CircuitState_B.HALF_OPEN:
-            if self._probes_used >= self.half_open_probes:
-                raise CircuitOpenError(f"circuit_half_open_busy:{self.name}")
-            self._probes_used += 1
-
-    def record_success(self) -> None:
-        self._failures = 0
-        self._state = CircuitState_B.CLOSED
-        self._probes_used = 0
-
-    def record_failure(self) -> None:
-        self._failures += 1
-        if self._state is CircuitState_B.HALF_OPEN:
-            self._state = CircuitState_B.OPEN
-            self._opened_at = time.monotonic()
-            return
-        if self._failures >= self.failure_threshold:
-            self._state = CircuitState_B.OPEN
-            self._opened_at = time.monotonic()
-
-
-@dataclass(frozen=True)
-class Authz_B:
-    """Server-side authorization. adapter_id NEVER parsed from model JSON."""
-    tenant_id: str
-    actor: str
-    allowed_adapter_id: str | None
-
-
-@dataclass(frozen=True)
-class Lineage:
-    """Full lineage tuple for idempotent job submission."""
-    dataset_hash: str
-    base_rev: str
-    peft_json: str
-    seed: int
-    code_sha: str
-
-    def idempotency_key(self) -> str:
-        raw = "|".join(
-            [self.dataset_hash, self.base_rev, self.peft_json, str(self.seed), self.code_sha]
+    Input: list of {"text": str, "label": str}
+    """
+    examples = []
+    for email in emails:
+        ex = create_sft_example(
+            system=f"{system_prompt}\nCategories: {', '.join(categories)}",
+            user=email["text"],
+            assistant=email["label"],
         )
-        return hashlib.sha256(raw.encode()).hexdigest()
+        examples.append(ex)
+    return examples
 
 
-@dataclass(frozen=True)
-class EvalReport:
-    """4-gate evaluation: task, forgetting, safety, serve-dtype."""
-    task_ok: bool
-    forgetting_ok: bool
-    safety_ok: bool
-    serve_dtype_ok: bool
-
-    def promote_allowed(self) -> bool:
-        return self.task_ok and self.forgetting_ok and self.safety_ok and self.serve_dtype_ok
-
-
-class JobClient(Protocol):
-    name: str
-    def submit(self, lineage: Lineage, method: str) -> str: ...
-    def status(self, job_id: str) -> str: ...
-
-
-class Generator_B(Protocol):
-    name: str
-    def complete(self, prompt: str, adapter_id: str | None) -> str: ...
-
+# --- LoRA / QLoRA Configuration ---
 
 @dataclass
-class JobRegistry:
-    """Process-local stand-in; production: Postgres unique(idempotency_key)."""
-    _jobs: dict[str, str] = field(default_factory=dict)
+class LoRAConfig:
+    """LoRA configuration with the math for interview discussion.
 
-    def get(self, key: str) -> str | None:
-        return self._jobs.get(key)
+    Core insight: weight updates during fine-tuning live in a low-rank subspace.
+    Instead of updating W directly, decompose: W' = W + (alpha/r) * B @ A
 
-    def put(self, key: str, job_id: str) -> None:
-        self._jobs[key] = job_id
+    Where:
+      W   = frozen pretrained weight (d_in x d_out)
+      A   = trainable (d_in x r), init from Kaiming uniform
+      B   = trainable (r x d_out), init to ZEROS (so W' = W at step 0)
+      r   = rank (8-64 typical; 4-256 range)
+      alpha = scaling factor (commonly 2*r)
 
+    B=0 initialization is critical: if both A and B were random,
+    training would start from a corrupted model.
+    """
+    rank: int = 16                      # r: 8-64 typical, 4-256 range
+    alpha: int = 32                     # commonly 2*r; ratio alpha/r controls magnitude
+    target_modules: list[str] = field(default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"])
+    dropout: float = 0.05
+    bias: str = "none"
 
-class FtControlPlane:
-    """Training-API breaker + idempotent submit. Eval gate is a hard block."""
+    def trainable_params_per_layer(self, d_in: int, d_out: int) -> int:
+        """Trainable parameters per adapted linear layer: r * (d_in + d_out)."""
+        return self.rank * (d_in + d_out)
 
-    def __init__(self, jobs: JobClient, registry: JobRegistry | None = None) -> None:
-        self.jobs = jobs
-        self.registry = registry or JobRegistry()
-        self.breaker = CircuitBreaker_B("train_api", cooldown_s=60.0)
+    def total_trainable_params(self, d_model: int, n_layers: int) -> dict:
+        """Calculate total trainable parameters for a transformer.
 
-    def submit_idempotent(
-        self, lineage: Lineage, method: str, cid: str, tenant: str
-    ) -> str:
-        key = lineage.idempotency_key()
-        existing = self.registry.get(key)
-        if existing:
-            slog(logging.INFO, "job_dedup", cid=cid, tenant=tenant, job=existing, key=key[:12])
-            return existing
-
-        def _op() -> str:
-            self.breaker.allow()
-            try:
-                jid = self.jobs.submit(lineage, method)
-            except PermanentError:
-                self.breaker.record_failure()
-                raise
-            except Exception as exc:
-                self.breaker.record_failure()
-                raise TransientError(str(exc)) from exc
-            self.breaker.record_success()
-            return jid
-
-        jid = retry_with_jitter(
-            _op, cid=cid, tenant=tenant, op="train_submit", attempts=3, base_s=0.2, cap_s=5.0
-        )
-        assert isinstance(jid, str)
-        self.registry.put(key, jid)
-        slog(logging.INFO, "job_submitted", cid=cid, tenant=tenant, job=jid, method=method)
-        return jid
-
-    def promote(self, adapter_id: str, report: EvalReport, cid: str, tenant: str) -> str:
-        if not report.promote_allowed():
-            slog(
-                logging.ERROR, "promote_blocked", cid=cid, tenant=tenant, job=adapter_id,
-                task=report.task_ok, forget=report.forgetting_ok,
-                safety=report.safety_ok, dtype=report.serve_dtype_ok,
-            )
-            raise PermanentError("eval_gate_failed")
-        slog(logging.INFO, "promote_ok", cid=cid, tenant=tenant, job=adapter_id)
-        return adapter_id
-
-
-@dataclass
-class DegradedResult:
-    """Result with degradation metadata for observability."""
-    text: str
-    adapter_degraded: bool
-    generation_degraded: bool
-    served: str  # adapter | base | deterministic
-
-
-class FtServeRuntime:
-    """Serve fallback: FT adapter -> base -> deterministic. Independent breakers."""
-
-    def __init__(
-        self,
-        adapter_gen: Generator_B,
-        base_gen: Generator_B,
-        adapter_timeout_s: float = 2.0,
-    ) -> None:
-        self.adapter_gen = adapter_gen
-        self.base_gen = base_gen
-        self.adapter_timeout_s = adapter_timeout_s
-        self.breakers = {
-            "adapter": CircuitBreaker_B("adapter_serve"),
-            "base": CircuitBreaker_B("base_serve"),
+        Example: Llama-3-8B, r=16, all attention (q,k,v,o), 32 layers:
+        2 * 16 * 4096 * 4 * 32 = 16.8M trainable vs 8B total = 0.21%
+        """
+        n_modules = len(self.target_modules)
+        # For attention: each projection is d_model x d_model (simplified)
+        params_per_layer = n_modules * self.trainable_params_per_layer(d_model, d_model)
+        total = params_per_layer * n_layers
+        return {
+            "params_per_layer": params_per_layer,
+            "total_trainable": total,
+            "total_trainable_m": round(total / 1e6, 2),
         }
 
-    def _call(self, gen: Generator_B, prompt: str, adapter_id: str | None,
-              cid: str, tenant: str) -> str:
-        br = self.breakers["adapter" if adapter_id else "base"]
+    def scaling_factor(self) -> float:
+        """The effective scaling: alpha / rank."""
+        return self.alpha / self.rank
 
-        def _op() -> str:
-            br.allow()
-            t0 = time.monotonic()
-            try:
-                text = gen.complete(prompt, adapter_id)
-            except PermanentError:
-                br.record_failure()
-                raise
-            except Exception as exc:
-                br.record_failure()
-                raise TransientError(str(exc)) from exc
-            if adapter_id and (time.monotonic() - t0) > self.adapter_timeout_s:
-                br.record_failure()
-                raise TransientError("adapter_ttft_timeout")
-            br.record_success()
-            return text
+    def to_peft_config(self) -> dict:
+        """Convert to HuggingFace PEFT LoraConfig kwargs.
 
-        label = f"generate:{gen.name}:{adapter_id or 'base'}"
-        return retry_with_jitter(_op, cid=cid, tenant=tenant, op=label)
-
-    def complete(self, prompt: str, authz: Authz_B, schema_fallback: str) -> DegradedResult:
-        cid = str(uuid.uuid4())
-        slog(logging.INFO, "serve_start", cid=cid, tenant=authz.tenant_id, q=prompt[:200])
-        aid = authz.allowed_adapter_id
-
-        # Level 1: Try fine-tuned adapter
-        if aid:
-            try:
-                text = self._call(self.adapter_gen, prompt, aid, cid, authz.tenant_id)
-                slog(logging.INFO, "serve_end", cid=cid, tenant=authz.tenant_id, served="adapter")
-                return DegradedResult(text, False, False, "adapter")
-            except (TransientError, PermanentError) as exc:
-                slog(logging.ERROR, "adapter_failed", cid=cid,
-                     tenant=authz.tenant_id, err=str(exc))
-
-        # Level 2: Fall back to base model (longer prompt / RAG belongs here)
-        try:
-            slog(logging.WARNING, "fallback_base", cid=cid, tenant=authz.tenant_id)
-            text = self._call(self.base_gen, prompt, None, cid, authz.tenant_id)
-            slog(logging.INFO, "serve_end", cid=cid, tenant=authz.tenant_id, served="base")
-            return DegradedResult(text, True, False, "base")
-        except (TransientError, PermanentError) as exc:
-            slog(logging.ERROR, "base_failed", cid=cid,
-                 tenant=authz.tenant_id, err=str(exc))
-
-        # Level 3: Deterministic fallback (regex/schema extract, canned response)
-        slog(logging.ERROR, "serve_deterministic", cid=cid, tenant=authz.tenant_id)
-        return DegradedResult(
-            f"Generation unavailable. Deterministic fallback: {schema_fallback}",
-            True,
-            True,
-            "deterministic",
-        )
+        In practice:
+        from peft import LoraConfig, get_peft_model
+        config = LoraConfig(**lora.to_peft_config())
+        model = get_peft_model(base_model, config)
+        """
+        return {
+            "r": self.rank,
+            "lora_alpha": self.alpha,
+            "target_modules": self.target_modules,
+            "lora_dropout": self.dropout,
+            "bias": self.bias,
+            "task_type": "CAUSAL_LM",
+        }
 
 
-# --- Demo backends (swap for real vLLM / vendor HTTP clients) ---
+@dataclass
+class QLoRAConfig(LoRAConfig):
+    """QLoRA: three innovations that put 65B fine-tuning on a single 48GB GPU.
 
-class FakeJobClient:
-    name = "train_api"
+    1. NF4 (4-bit NormalFloat): info-theoretically optimal for N(0,1) weights.
+       Matches FP16 training quality.
+    2. Double quantization: quantize the quantization constants.
+       Saves ~0.373 bits/param = ~3 GB on 65B model.
+    3. Paged optimizers: CPU+GPU unified memory for optimizer states.
+       Pages evict on OOM, page back for backward pass.
 
-    def submit(self, lineage: Lineage, method: str) -> str:
-        _ = method
-        return f"job-{lineage.idempotency_key()[:8]}"
+    Memory math:
+      NF4 base: ~0.5 bytes/param
+      LoRA adapters in BF16: ~2 bytes/param but only on 0.2-1% of params
+      Optimizer (AdamW): 2 states x BF16 per LoRA param
+      65B QLoRA total: ~33 GB base + ~2 GB adapters + ~4 GB optimizer = fits 48 GB
 
-    def status(self, job_id: str) -> str:
-        return f"succeeded:{job_id}"
+    Guanaco/QLoRA: top model 99.3% of ChatGPT on Vicuna; 33B at 97.8%.
+    Training: 24 hours on single GPU.
+    """
+    bits: int = 4                       # NF4 quantization
+    quant_type: str = "nf4"             # info-theoretically optimal for N(0,1)
+    double_quant: bool = True           # quantize the quant constants (~3 GB savings on 65B)
+    compute_dtype: str = "bfloat16"     # computation dtype for adapters
+
+    def memory_estimate_gb(self, total_params_b: float) -> dict:
+        """Estimate GPU memory for QLoRA training.
+
+        total_params_b: total parameters in billions (e.g. 7.0 for Llama-3-8B)
+        """
+        base_gb = total_params_b * 0.5  # NF4: ~0.5 bytes/param
+        trainable_frac = 0.005           # ~0.5% of params are trainable
+        adapter_gb = total_params_b * trainable_frac * 2  # BF16
+        optimizer_gb = adapter_gb * 2     # AdamW: 2 states
+        overhead_gb = 1.0                 # activations, framework
+
+        total = base_gb + adapter_gb + optimizer_gb + overhead_gb
+        return {
+            "base_model_gb": round(base_gb, 1),
+            "adapter_gb": round(adapter_gb, 2),
+            "optimizer_gb": round(optimizer_gb, 2),
+            "overhead_gb": overhead_gb,
+            "total_gb": round(total, 1),
+            "fits_48gb": total <= 48,
+            "fits_80gb": total <= 80,
+        }
+
+    def to_bnb_config(self) -> dict:
+        """Convert to BitsAndBytesConfig kwargs.
+
+        In practice:
+        from transformers import BitsAndBytesConfig
+        bnb = BitsAndBytesConfig(**qlora.to_bnb_config())
+        model = AutoModelForCausalLM.from_pretrained(name, quantization_config=bnb)
+        """
+        return {
+            "load_in_4bit": self.bits == 4,
+            "bnb_4bit_quant_type": self.quant_type,
+            "bnb_4bit_use_double_quant": self.double_quant,
+            "bnb_4bit_compute_dtype": self.compute_dtype,
+        }
 
 
-class StaticGenerator:
-    def __init__(self, name: str, fail: bool = False) -> None:
-        self.name = name
-        self.fail = fail
+# --- Training Loop with Validation ---
 
-    def complete(self, prompt: str, adapter_id: str | None) -> str:
-        if self.fail:
-            raise TransientError("simulated_outage")
-        tag = adapter_id or "base"
-        return f"[{tag}] {prompt[:40]}"
+@dataclass
+class TrainingConfig:
+    """Training hyperparameters for SFT.
 
+    Default: QLoRA r=16, alpha=32, all attention projections, 3 epochs,
+    early stopping on validation loss.
+    """
+    num_epochs: int = 3
+    batch_size: int = 4
+    learning_rate: float = 2e-4
+    warmup_ratio: float = 0.1
+    weight_decay: float = 0.01
+    gradient_accumulation_steps: int = 4
+    max_grad_norm: float = 1.0
+    early_stopping_patience: int = 3    # stop if val loss doesn't improve for N evals
+    eval_steps: int = 50
+    save_steps: int = 100
+    logging_steps: int = 10
+
+
+def simulate_training_loop(
+    train_data: list[dict],
+    val_data: list[dict],
+    config: TrainingConfig,
+) -> dict:
+    """Simulate a training loop to illustrate the key patterns.
+
+    In production: use HuggingFace TRL SFTTrainer or Axolotl.
+    Key patterns to discuss in interview:
+    1. Validation loss tracking (not just training loss)
+    2. Early stopping to prevent overfitting
+    3. Checkpoint saving for rollback
+    4. Learning rate warmup + decay
+    """
+    steps_per_epoch = max(
+        len(train_data) // (config.batch_size * config.gradient_accumulation_steps), 1
+    )
+    total_steps = steps_per_epoch * config.num_epochs
+    warmup_steps = int(total_steps * config.warmup_ratio)
+
+    history = {
+        "train_loss": [],
+        "val_loss": [],
+        "learning_rates": [],
+        "best_val_loss": float("inf"),
+        "best_step": 0,
+        "early_stopped": False,
+        "patience_counter": 0,
+    }
+
+    for step in range(1, total_steps + 1):
+        # Simulate decreasing training loss with noise
+        progress = step / total_steps
+        train_loss = 2.5 * math.exp(-3 * progress) + 0.1 * (0.5 - progress) * (step % 7) / 7
+        train_loss = max(train_loss, 0.1)
+
+        # LR schedule: linear warmup then cosine decay
+        if step <= warmup_steps:
+            lr = config.learning_rate * step / max(warmup_steps, 1)
+        else:
+            decay_ratio = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+            lr = config.learning_rate * 0.5 * (1 + math.cos(math.pi * decay_ratio))
+
+        history["train_loss"].append(round(train_loss, 4))
+        history["learning_rates"].append(round(lr, 8))
+
+        # Validation at eval_steps intervals
+        if step % config.eval_steps == 0:
+            # Simulate val loss (slightly higher than train, potential overfitting)
+            val_loss = train_loss * 1.1 + 0.05 * max(0, progress - 0.6)
+
+            history["val_loss"].append(round(val_loss, 4))
+
+            if val_loss < history["best_val_loss"]:
+                history["best_val_loss"] = round(val_loss, 4)
+                history["best_step"] = step
+                history["patience_counter"] = 0
+            else:
+                history["patience_counter"] += 1
+
+            # Early stopping: critical to prevent catastrophic forgetting
+            if history["patience_counter"] >= config.early_stopping_patience:
+                history["early_stopped"] = True
+                break
+
+    history["total_steps_run"] = step
+    history["total_steps_planned"] = total_steps
+    return history
+
+
+# --- DPO Preference Data Format ---
+
+def create_dpo_example(
+    prompt: str,
+    chosen: str,
+    rejected: str,
+) -> dict:
+    """Create a DPO training example.
+
+    DPO (Rafailov et al., NeurIPS 2023): learns preferences from (prompt, chosen,
+    rejected) pairs without training a separate reward model.
+
+    Key hyperparameter: beta=0.1 (KL penalty).
+    - beta too high -> model barely moves from base (underfitting)
+    - beta too low -> policy collapses to always producing "chosen" (overfitting)
+    - Start at 0.1, sweep [0.05, 0.3]
+
+    Prerequisites for DPO:
+    1. Base model must already produce reasonable outputs (SFT first)
+    2. DPO on an unaligned base is UNSTABLE
+    3. Chosen/rejected pairs must be clean -- contradictory pairs teach noise
+    """
+    return {
+        "prompt": prompt,
+        "chosen": chosen,
+        "rejected": rejected,
+    }
+
+
+def create_kto_example(prompt: str, completion: str, thumbs_up: bool) -> dict:
+    """Create a KTO training example (Ethayarajh et al., 2024).
+
+    KTO needs only binary feedback (thumbs up/down), not paired comparisons.
+    Use when: production logs have like/dislike but you cannot get paired data.
+    """
+    return {
+        "prompt": prompt,
+        "completion": completion,
+        "label": thumbs_up,
+    }
+
+
+def create_grpo_batch(
+    prompt: str,
+    completions: list[str],
+    rewards: list[float],
+) -> dict:
+    """Create a GRPO training batch (Shao et al., DeepSeek-R1, 2024).
+
+    GRPO workflow:
+    1. For each prompt, sample G=64 completions
+    2. Score each with a VERIFIABLE reward (unit test, math checker)
+    3. Compute group-relative advantage: A_i = (r_i - mean(r)) / std(r)
+    4. Update policy with clipped surrogate objective
+    No critic model needed (unlike PPO).
+
+    Use only when you have a reliable automated grader (math, code, structured output).
+    DeepSeek-R1 used GRPO to bootstrap reasoning without any SFT data.
+    """
+    mean_r = sum(rewards) / len(rewards)
+    std_r = max(
+        math.sqrt(sum((r - mean_r) ** 2 for r in rewards) / len(rewards)),
+        1e-8,
+    )
+    advantages = [(r - mean_r) / std_r for r in rewards]
+
+    return {
+        "prompt": prompt,
+        "completions": completions,
+        "rewards": rewards,
+        "advantages": [round(a, 4) for a in advantages],
+        "group_size": len(completions),
+    }
+
+
+# --- When-to-Use Decision Function ---
+
+class Approach(Enum):
+    PROMPTING = "prompting"
+    RAG = "rag"
+    WORKFLOW = "workflow"
+    FINE_TUNING = "fine_tuning"
+    RAG_PLUS_FT = "rag_plus_fine_tuning"
+
+
+def decide_approach(
+    need_private_knowledge: bool = False,
+    knowledge_changes_frequently: bool = False,
+    need_style_or_format_change: bool = False,
+    need_domain_vocabulary: bool = False,
+    need_tool_call_patterns: bool = False,
+    need_safety_refusals: bool = False,
+    prompt_complexity_high: bool = False,
+    millions_of_requests: bool = False,
+    have_labeled_data: bool = False,
+    have_paired_preferences: bool = False,
+    need_orchestration_logic: bool = False,
+) -> dict:
+    """Decision ladder: Prompt -> RAG -> Workflow -> Fine-tune.
+
+    Fine-tuning is for BEHAVIOR, not FACTS. The biggest anti-pattern is
+    using fine-tuning to memorize knowledge that should live in retrieval --
+    it creates stale answers and retraining churn.
+
+    Fine-tune when:
+    - Stable behavior changes (formatting, tone, tool-call style, domain vocab)
+    - Need that behavior across millions of requests (prompt length savings)
+    - Have labeled data (minimum ~50 examples, practical ~1k+)
+
+    Use RAG when:
+    - Private or fast-changing knowledge
+    - Need citations and provenance
+
+    The best answer is often BOTH: RAG for facts, fine-tuning for behavior.
+    """
+    reasons = []
+    approach = Approach.PROMPTING
+
+    # RAG signals
+    if need_private_knowledge or knowledge_changes_frequently:
+        approach = Approach.RAG
+        reasons.append("Private/changing knowledge -> RAG for retrieval")
+
+    # Workflow/validator signals
+    if need_orchestration_logic:
+        approach = Approach.WORKFLOW
+        reasons.append("Orchestration logic -> Workflow/validators")
+
+    # Fine-tuning signals
+    ft_signals = sum([
+        need_style_or_format_change,
+        need_domain_vocabulary,
+        need_tool_call_patterns,
+        need_safety_refusals,
+        prompt_complexity_high and millions_of_requests,
+    ])
+
+    if ft_signals >= 2 and have_labeled_data:
+        if approach == Approach.RAG:
+            approach = Approach.RAG_PLUS_FT
+            reasons.append("Behavior change + knowledge -> RAG + fine-tuning")
+        else:
+            approach = Approach.FINE_TUNING
+            reasons.append("Stable behavior change with labeled data -> fine-tune")
+
+    if not reasons:
+        reasons.append("Light behavior change -> prompting is sufficient")
+
+    return {
+        "recommended": approach.value,
+        "reasons": reasons,
+        "data_requirements": {
+            "sft_minimum": "50 examples (Azure hard min: 10)",
+            "sft_practical": "1,000+ curated examples (LIMA showed this rivals 50k noisy)",
+            "dpo_pairs": "5,000+ (prompt, chosen, rejected) triples",
+            "grpo": "Requires verifiable reward function (math/code)",
+        },
+    }
+
+
+# --- Evaluation Before/After Fine-Tuning ---
+
+@dataclass
+class EvalGate:
+    """Four-gate evaluation before promoting a fine-tuned adapter.
+
+    Every adapter must pass ALL four checks before entering canary deployment.
+    Deploying based on training loss alone is the second-biggest anti-pattern.
+    """
+    task_quality_threshold: float = 0.80    # Domain-specific accuracy/F1
+    max_forgetting_delta: float = 0.01      # < 1% drop on general capabilities
+    safety_pass_required: bool = True       # Zero regressions on safety suite
+    max_dtype_delta: float = 0.005          # < 0.5% quality loss from quantization
+
+
+@dataclass
+class EvalResult:
+    """Result of evaluating a model (base or fine-tuned) on a benchmark suite."""
+    model_name: str
+    task_score: float           # Domain-specific metric
+    general_score: float        # MMLU/HumanEval subset
+    safety_score: float         # Refusal on harmful prompts
+    serve_dtype_score: float    # Quality in serving precision (INT8/BF16)
+
+    def passes_gate(self, gate: EvalGate, baseline: Optional["EvalResult"] = None) -> dict:
+        """Check all four eval gates.
+
+        The forgetting check compares against a baseline (pre-FT model).
+        This is the Biderman et al. "Loser" principle: track AVERAGE performance
+        across all tasks, not just the latest one.
+        """
+        checks = {}
+
+        # Gate 1: Task quality meets threshold
+        checks["task_quality"] = {
+            "passed": self.task_score >= gate.task_quality_threshold,
+            "score": self.task_score,
+            "threshold": gate.task_quality_threshold,
+        }
+
+        # Gate 2: Forgetting delta on general holdout
+        if baseline:
+            delta = baseline.general_score - self.general_score
+            checks["forgetting"] = {
+                "passed": delta <= gate.max_forgetting_delta,
+                "delta": round(delta, 4),
+                "max_allowed": gate.max_forgetting_delta,
+            }
+        else:
+            checks["forgetting"] = {"passed": True, "note": "no baseline provided"}
+
+        # Gate 3: Safety -- zero regressions
+        checks["safety"] = {
+            "passed": self.safety_score >= 1.0 if gate.safety_pass_required else True,
+            "score": self.safety_score,
+        }
+
+        # Gate 4: Serve-dtype parity
+        if baseline:
+            dtype_delta = abs(baseline.serve_dtype_score - self.serve_dtype_score)
+            checks["serve_dtype"] = {
+                "passed": dtype_delta <= gate.max_dtype_delta,
+                "delta": round(dtype_delta, 4),
+                "max_allowed": gate.max_dtype_delta,
+            }
+        else:
+            checks["serve_dtype"] = {"passed": True, "note": "no baseline provided"}
+
+        all_passed = all(c["passed"] for c in checks.values())
+
+        return {
+            "model": self.model_name,
+            "all_gates_passed": all_passed,
+            "gates": checks,
+            "recommendation": "PROMOTE to canary" if all_passed else "REJECT -- fix failing gates",
+        }
+
+
+def compare_before_after(
+    base_result: EvalResult,
+    ft_result: EvalResult,
+    gate: EvalGate,
+) -> dict:
+    """Compare base vs fine-tuned model across all evaluation dimensions.
+
+    This is the evaluation workflow you'd discuss in an interview:
+    1. Run general capability holdout BEFORE fine-tuning (baseline)
+    2. Fine-tune with LoRA/QLoRA
+    3. Run same holdout AFTER fine-tuning
+    4. Check all four gates
+    5. Only then enter canary deployment (5% -> 25% -> 100%)
+    """
+    gate_result = ft_result.passes_gate(gate, baseline=base_result)
+
+    return {
+        "base": {
+            "task": base_result.task_score,
+            "general": base_result.general_score,
+            "safety": base_result.safety_score,
+        },
+        "fine_tuned": {
+            "task": ft_result.task_score,
+            "general": ft_result.general_score,
+            "safety": ft_result.safety_score,
+        },
+        "deltas": {
+            "task_improvement": round(ft_result.task_score - base_result.task_score, 4),
+            "general_regression": round(base_result.general_score - ft_result.general_score, 4),
+            "safety_regression": round(base_result.safety_score - ft_result.safety_score, 4),
+        },
+        "gate_result": gate_result,
+    }
+
+
+# --- Cost Estimator ---
+
+def training_cost_estimate(
+    total_params_b: float,
+    num_examples: int,
+    avg_tokens_per_example: int = 1000,
+    num_epochs: int = 3,
+    method: str = "qlora",
+    gpu_type: str = "A100_80GB",
+    spot_price_per_hr: float = 1.50,
+    vendor_api_price_per_m: float = None,
+) -> dict:
+    """Estimate fine-tuning cost.
+
+    Key benchmarks:
+    - 7B SFT, 10k examples, 3 epochs, QLoRA r=16: ~2-4 hrs A100, $3-6 spot
+    - 70B SFT, 50k examples, 3 epochs, QLoRA r=32: ~24-48 hrs 4xA100, $144-288
+    - gpt-4.1-mini, 10k examples, 3 epochs, API: ~$54 ($1.80/1M x ~10M x 3)
+    - gpt-4.1, 10k examples, 3 epochs, API: ~$360 ($12/1M x ~10M x 3)
+    """
+    total_tokens = num_examples * avg_tokens_per_example * num_epochs
+
+    if vendor_api_price_per_m is not None:
+        # Vendor API pricing
+        cost = total_tokens * vendor_api_price_per_m / 1_000_000
+        return {
+            "method": "vendor_api",
+            "total_tokens": total_tokens,
+            "cost_usd": round(cost, 2),
+            "time_estimate": "30-120 minutes (vendor managed)",
+        }
+
+    # Self-hosted estimate
+    if method == "qlora":
+        # Rough: ~2-4 hrs per 10k examples for 7B
+        scale_factor = total_params_b / 7.0
+        base_hours = 3 * (num_examples / 10000) * num_epochs / 3
+        gpu_hours = base_hours * scale_factor
+        num_gpus = 1 if total_params_b <= 70 else 4
+        if total_params_b > 70:
+            gpu_hours = gpu_hours / 2  # Parallelism
+    else:  # full ft
+        scale_factor = total_params_b / 7.0
+        gpu_hours = 8 * (num_examples / 10000) * num_epochs / 3 * scale_factor
+        num_gpus = max(1, int(math.ceil(total_params_b / 10)))
+
+    cost = gpu_hours * num_gpus * spot_price_per_hr
+
+    return {
+        "method": method,
+        "gpu_type": gpu_type,
+        "num_gpus": num_gpus,
+        "gpu_hours": round(gpu_hours, 1),
+        "cost_usd": round(cost, 2),
+        "total_tokens": total_tokens,
+    }
+
+
+# --- Adapter Serving Economics ---
+
+def multi_tenant_serving_cost(
+    num_tenants: int,
+    base_model_gpus: int = 2,
+    gpu_price_per_hr: float = 5.0,
+    hours_per_month: int = 720,
+) -> dict:
+    """Compare adapter serving vs separate deployments.
+
+    vLLM multi-LoRA: --enable-lora --max-loras 16 --max-lora-rank 64
+    Punica SGMV kernel: ~2ms/token overhead at batch 16. Hot-swap per-request.
+
+    At 100+ tenants, adapter serving is ~50-100x cheaper than separate deployments.
+    Trade-off: shared base means all tenants upgrade/downgrade together.
+    """
+    # Adapter serving: one base model, N adapters in RAM
+    adapter_monthly = base_model_gpus * gpu_price_per_hr * hours_per_month
+    adapter_per_tenant = adapter_monthly / num_tenants
+
+    # Separate deployments: N x base model
+    separate_monthly = num_tenants * base_model_gpus * gpu_price_per_hr * hours_per_month
+    separate_per_tenant = separate_monthly / num_tenants
+
+    savings_ratio = separate_monthly / max(adapter_monthly, 1)
+
+    return {
+        "adapter_serving": {
+            "total_monthly": round(adapter_monthly, 2),
+            "per_tenant_monthly": round(adapter_per_tenant, 2),
+        },
+        "separate_deployments": {
+            "total_monthly": round(separate_monthly, 2),
+            "per_tenant_monthly": round(separate_per_tenant, 2),
+        },
+        "savings_ratio": round(savings_ratio, 1),
+        "note": f"Adapter serving is {round(savings_ratio)}x cheaper for {num_tenants} tenants",
+    }
+
+
+# --- Demo ---
 
 if __name__ == "__main__":
-    cid = str(uuid.uuid4())
-    lineage = Lineage(
-        dataset_hash="sha256:abc",
-        base_rev="llama-3.1-8b@rev1",
-        peft_json='{"r":32,"alpha":64,"target":"all-linear"}',
-        seed=42,
-        code_sha="deadbeef",
+    print("=" * 60)
+    print("Fine-Tuning Interview Prep -- Runnable Demos")
+    print("=" * 60)
+
+    # 1. SFT data preparation
+    print("\n--- SFT Data Preparation ---")
+    examples = [
+        create_sft_example(
+            system="Classify the email category.",
+            user="I want to return my order #12345",
+            assistant="return",
+        ),
+        create_sft_example(
+            system="Classify the email category.",
+            user="My package hasn't arrived yet",
+            assistant="shipping",
+        ),
+        create_sft_example(
+            system="Classify the email category.",
+            user="I was charged twice for my order",
+            assistant="billing",
+        ),
+    ]
+    # Pad to 50+ for the validator
+    examples = examples * 20
+
+    report = validate_sft_dataset(examples)
+    print(f"Dataset quality: {report['quality_score']}")
+    print(f"Ready for training: {report['ready_for_training']}")
+    print(f"Duplicates found: {report['duplicates']}")
+
+    # 2. LoRA configuration
+    print("\n--- LoRA/QLoRA Configuration ---")
+    lora = LoRAConfig(rank=16, alpha=32)
+    # Llama-3-8B: d_model=4096, 32 layers
+    params = lora.total_trainable_params(d_model=4096, n_layers=32)
+    print(f"Trainable params: {params['total_trainable_m']}M (r={lora.rank})")
+    print(f"Scaling factor (alpha/r): {lora.scaling_factor()}")
+
+    qlora = QLoRAConfig(rank=16, alpha=32)
+    mem = qlora.memory_estimate_gb(total_params_b=7.0)
+    print(f"\nQLoRA memory (7B): {mem['total_gb']} GB")
+    print(f"  Base (NF4):     {mem['base_model_gb']} GB")
+    print(f"  Adapters:       {mem['adapter_gb']} GB")
+    print(f"  Optimizer:      {mem['optimizer_gb']} GB")
+    print(f"  Fits 48GB GPU:  {mem['fits_48gb']}")
+
+    mem_65b = qlora.memory_estimate_gb(total_params_b=65.0)
+    print(f"\nQLoRA memory (65B): {mem_65b['total_gb']} GB")
+    print(f"  Fits 48GB GPU:  {mem_65b['fits_48gb']}")
+
+    # 3. DPO preference data
+    print("\n--- DPO Preference Format ---")
+    dpo_ex = create_dpo_example(
+        prompt="How do I return a product?",
+        chosen="You can initiate a return within 30 days through your order page.",
+        rejected="Returns? I guess you could try the website or something.",
     )
-    control = FtControlPlane(FakeJobClient())
-    jid = control.submit_idempotent(lineage, "sft", cid, "acme")
-    jid2 = control.submit_idempotent(lineage, "sft", cid, "acme")
-    assert jid == jid2  # idempotent: same lineage -> same job
-    control.promote(
-        "adapter-v3",
-        EvalReport(True, True, True, True),
-        cid,
-        "acme",
+    print(f"DPO example keys: {list(dpo_ex.keys())}")
+
+    # 4. GRPO batch with advantages
+    print("\n--- GRPO Group-Relative Advantages ---")
+    grpo = create_grpo_batch(
+        prompt="Write a function to sort a list",
+        completions=["def sort(l): return sorted(l)", "print('hello')", "def sort(l):\n  l.sort()\n  return l"],
+        rewards=[1.0, 0.0, 1.0],
     )
-    serve = FtServeRuntime(
-        adapter_gen=StaticGenerator("adapter_gen", fail=True),
-        base_gen=StaticGenerator("base_gen"),
+    print(f"GRPO advantages: {grpo['advantages']}")
+    print(f"Group size: {grpo['group_size']}")
+
+    # 5. Decision function
+    print("\n--- When to Fine-Tune Decision ---")
+    decision = decide_approach(
+        need_private_knowledge=True,
+        need_style_or_format_change=True,
+        need_domain_vocabulary=True,
+        have_labeled_data=True,
     )
-    authz = Authz_B(tenant_id="acme", actor="u1", allowed_adapter_id="adapter-v3")
-    result = serve.complete("Emit the ticket JSON schema only.", authz, '{"status":"degraded"}')
-    print(json.dumps({
-        "job_id": jid,
-        "dedup_ok": jid == jid2,
-        "text": result.text,
-        "served": result.served,
-        "adapter_degraded": result.adapter_degraded,
-        "generation_degraded": result.generation_degraded,
-    }, indent=2))
+    print(f"Recommended: {decision['recommended']}")
+    print(f"Reasons: {decision['reasons']}")
+
+    # 6. Eval gate
+    print("\n--- Eval Gate: Before/After Fine-Tuning ---")
+    base = EvalResult("llama-3-8b-base", task_score=0.72, general_score=0.85,
+                      safety_score=1.0, serve_dtype_score=0.84)
+    ft = EvalResult("llama-3-8b-lora-r16", task_score=0.89, general_score=0.845,
+                    safety_score=1.0, serve_dtype_score=0.838)
+
+    comparison = compare_before_after(base, ft, EvalGate())
+    print(f"Task improvement:     +{comparison['deltas']['task_improvement']:.1%}")
+    print(f"General regression:   -{comparison['deltas']['general_regression']:.1%}")
+    print(f"All gates passed:     {comparison['gate_result']['all_gates_passed']}")
+    print(f"Recommendation:       {comparison['gate_result']['recommendation']}")
+
+    # 7. Cost estimates
+    print("\n--- Training Cost Estimates ---")
+    qlora_cost = training_cost_estimate(
+        total_params_b=7.0, num_examples=10000, method="qlora"
+    )
+    print(f"QLoRA 7B, 10k examples: ${qlora_cost['cost_usd']} ({qlora_cost['gpu_hours']}h)")
+
+    api_cost = training_cost_estimate(
+        total_params_b=0, num_examples=10000, vendor_api_price_per_m=1.80
+    )
+    print(f"gpt-4.1-mini API, 10k examples: ${api_cost['cost_usd']}")
+
+    # 8. Multi-tenant serving
+    print("\n--- Multi-Tenant Serving Economics ---")
+    serving = multi_tenant_serving_cost(num_tenants=200)
+    print(f"Adapter serving: ${serving['adapter_serving']['per_tenant_monthly']:.0f}/tenant/mo")
+    print(f"Separate deploys: ${serving['separate_deployments']['per_tenant_monthly']:.0f}/tenant/mo")
+    print(f"{serving['note']}")

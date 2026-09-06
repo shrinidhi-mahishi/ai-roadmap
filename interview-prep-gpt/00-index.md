@@ -4,6 +4,7 @@ This folder now has two linked tracks:
 
 - `01` to `07`: general AI systems and interview fundamentals
 - `08` to `23`: Deep Agents concepts from the LangChain Python OSS docs
+- `24` to `28`: advanced AI platform, protocol, and system design topics
 
 Use this index when you want a clear read order instead of jumping between files.
 
@@ -67,6 +68,24 @@ Why this order:
 - `Delegation`, `Task Planning`, and `Subagents` explain how Deep Agents break work apart.
 - `Steering and Human-in-the-Loop` closes with runtime control and approvals.
 
+### Phase 4: Advanced Platform and Interview Rounds
+
+Use this final phase when you want deeper infrastructure, release engineering, and system-design coverage.
+
+24. [Embeddings and Vector Databases](24-embeddings-and-vector-databases.md)
+25. [Prompt Engineering Patterns](25-prompt-engineering-patterns.md)
+26. [LLMOps and CI/CD for AI](26-llmops-and-ci-cd-for-ai.md)
+27. [AI System Design](27-ai-system-design.md)
+28. [Model Context Protocol](28-model-context-protocol.md)
+
+Why this order:
+
+- `Embeddings and Vector Databases` deepens the retrieval and serving layer behind RAG systems.
+- `Prompt Engineering Patterns` covers the interface-design layer before you think about deployment and evaluation loops.
+- `LLMOps and CI/CD for AI` explains how AI systems are versioned, evaluated, promoted, and rolled back.
+- `AI System Design` ties the earlier concepts into reusable interview answers for chatbot, search, copilot, and moderation systems.
+- `Model Context Protocol` closes with interoperability and tool-bus architecture that often appears in modern agent-platform interviews.
+
 ## Fast Review Paths
 
 ### 60-minute interview cram
@@ -82,6 +101,7 @@ Read these if you need the highest-yield concepts quickly:
 7. [Tools and MCP](10-tools-and-mcp.md)
 8. [Subagents](22-subagents.md)
 9. [Steering and Human-in-the-Loop](23-steering-and-human-in-the-loop.md)
+10. [AI System Design](27-ai-system-design.md)
 
 ### Deep Agents implementation path
 
@@ -98,6 +118,7 @@ Use this when the interview is likely to ask how you would build or customize a 
 9. [Memory](17-memory.md)
 10. [Subagents](22-subagents.md)
 11. [Steering and Human-in-the-Loop](23-steering-and-human-in-the-loop.md)
+12. [Model Context Protocol](28-model-context-protocol.md)
 
 ### Operations and production path
 
@@ -113,6 +134,7 @@ Use this when you want the reliability and safety story:
 8. [Summarization and Context Offloading](18-summarization-and-context-offloading.md)
 9. [Prompt Caching](19-prompt-caching.md)
 10. [Steering and Human-in-the-Loop](23-steering-and-human-in-the-loop.md)
+11. [LLMOps and CI/CD for AI](26-llmops-and-ci-cd-for-ai.md)
 
 ## Interview Theme Map
 
@@ -121,8 +143,17 @@ Use this when you want to answer a specific style of question.
 - `RAG vs fine-tuning vs caching`:
   [RAG](01-rag.md), [Fine-tuning](02-fine-tuning.md), [Caching](03-caching.md)
 
+- `How do embeddings, ANN indexes, and vector stores affect retrieval quality?`:
+  [RAG](01-rag.md), [Embeddings and Vector Databases](24-embeddings-and-vector-databases.md)
+
+- `How do prompting patterns compare to fine-tuning or tool use?`:
+  [Fine-tuning](02-fine-tuning.md), [Prompt Engineering Patterns](25-prompt-engineering-patterns.md), [Tools and MCP](10-tools-and-mcp.md)
+
 - `How do you evaluate and operate AI systems in production?`:
   [Evals](04-evals.md), [Observability](05-observability.md), [Caching](03-caching.md), [Guardrails](07-guardrails.md)
+
+- `How do you release and govern LLM changes safely?`:
+  [Evals](04-evals.md), [Observability](05-observability.md), [LLMOps and CI/CD for AI](26-llmops-and-ci-cd-for-ai.md), [Steering and Human-in-the-Loop](23-steering-and-human-in-the-loop.md)
 
 - `How do you keep agents from going off the rails?`:
   [Agent Feedback Loops](06-agent-feedback-loops.md), [Guardrails](07-guardrails.md), [Filesystem Permissions](12-filesystem-permissions.md), [Steering and Human-in-the-Loop](23-steering-and-human-in-the-loop.md)
@@ -136,12 +167,19 @@ Use this when you want to answer a specific style of question.
 - `How do subagents, planning, and approvals fit together?`:
   [Delegation](20-delegation.md), [Task Planning](21-task-planning.md), [Subagents](22-subagents.md), [Steering and Human-in-the-Loop](23-steering-and-human-in-the-loop.md)
 
+- `How should I answer an AI system design round?`:
+  [AI System Design](27-ai-system-design.md), [RAG](01-rag.md), [Guardrails](07-guardrails.md), [LLMOps and CI/CD for AI](26-llmops-and-ci-cd-for-ai.md)
+
+- `How does MCP fit into modern agent stacks?`:
+  [Tools and MCP](10-tools-and-mcp.md), [Subagents](22-subagents.md), [Model Context Protocol](28-model-context-protocol.md)
+
 ## Suggested Study Cadence
 
 ### Pass 1: Read for structure
 
 - Read `01` to `07` once without memorizing details.
 - Read `08` to `23` once with attention to exact Deep Agents APIs and config names.
+- Read `24` to `28` once as the bridge from concepts to platform and interview-round synthesis.
 
 ### Pass 2: Rehearse orally
 
@@ -161,9 +199,11 @@ Use this when you want to answer a specific style of question.
 Practice explaining these flows from memory:
 
 - A production RAG pipeline
+- An embeddings plus vector-store selection argument
 - A Deep Agents execution environment
 - A safe tool call with MCP plus human approval
 - A long-running agent with memory, summarization, and subagents
+- An end-to-end AI system design answer for chatbot, search, or copilot
 
 ## High-Yield Files
 
@@ -179,3 +219,7 @@ If you only revisit a handful before an interview, use:
 8. [Context Management](15-context-management.md)
 9. [Subagents](22-subagents.md)
 10. [Steering and Human-in-the-Loop](23-steering-and-human-in-the-loop.md)
+11. [Embeddings and Vector Databases](24-embeddings-and-vector-databases.md)
+12. [LLMOps and CI/CD for AI](26-llmops-and-ci-cd-for-ai.md)
+13. [AI System Design](27-ai-system-design.md)
+14. [Model Context Protocol](28-model-context-protocol.md)
